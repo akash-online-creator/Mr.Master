@@ -1,0 +1,7 @@
+flask
+requests
+pandas
+numpy
+python-binance
+pytz
+gunicorn
