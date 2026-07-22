@@ -350,8 +350,8 @@ def live_monitor_loop():
                     elif (side == "BUY" and current_p <= pos['sl']) or (side == "SELL" and current_p >= pos['sl']):
                         print(f"🛑 SL HIT for {s}! Price: {current_p} <= SL: {pos['sl']}") # Print statement
                         # ... (ඔබේ ඉතිරි SL කේතය එලෙසම තබන්න)
-                except Exception as e:
-                    print(f"Error in live monitor loop: {e}")
+               except Exception as e:
+                  print(f"Error in live monitor loop: {e}")
 
 # # --- 📅 DAILY PERFORMANCE REPORT ---
 def cron_daily_report_worker():
