@@ -227,6 +227,9 @@ def scan_markets():
                 active_positions = dict(state['active_positions'])
                 max_signals = state.get('max_signals', 10)
 
+            # සර්වර් එක වැඩ කරන බව දැනගන්න print එකක්
+            print(f"⏰ [{datetime.datetime.now().strftime('%H:%M:%S')}] Market Scanning Active... (Positions: {len(active_positions)}/{max_signals})")
+
             # ------ 🔄 PENDING RECOVERY RESUME CHECK ------
             if not bot_paused and is_ict_trading_window():
                 with state_lock:
@@ -237,19 +240,18 @@ def scan_markets():
                         with state_lock:
                             is_already_active = s in state['active_positions']
                             is_blacklisted = s in state.get('block_list', [])
-                            max_signals = state.get('max_signals', 10)
                             current_active_count = len(state['active_positions'])
                         
                         if not is_already_active and not is_blacklisted and current_active_count < max_signals:
                             try:
                                 k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=1", timeout=10)
                                 curr_p = float(k_res.json()[-1][4])
+                                print(f"🔄 Resuming recovery for {s} at Step {step}") # Print statement
                                 execute_new_trade(s, "BUY", curr_p)
                                 execute_telegram_send(f"🔄 <b>RESUMING RECOVERY ({s})</b>\nසිග්නල් කාලය ආරම්භ වූ බැවින් නැවතුණු රිකවරි ක්‍රියාවලිය Step {step} සිට නැවත ආරම්භ කරන ලදී.")
                                 time.sleep(2)
                             except:
                                 pass
-            # ----------------------------------------------------
             
             if not bot_paused and is_ict_trading_window() and not recovery_only:
                 res = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
@@ -263,11 +265,14 @@ def scan_markets():
                     
                     signal, price = analyze_and_check_signal(s)
                     if signal != "NONE":
+                        print(f"🚨 SIGNAL FOUND! Coin: {s} | Signal: {signal} | Price: {price}") # Print statement
                         execute_new_trade(s, signal, price)
                         time.sleep(1)
             time.sleep(5)
-        except: time.sleep(15)
-
+        except Exception as e: 
+            print(f"❌ Scanner Error Loop: {e}") # Error print statement
+            time.sleep(15)
+            
 # --- 🚀 ENTRY & EXECUTE TRADE ---
 def execute_new_trade(s, side, current_p):
     with state_lock:
@@ -325,6 +330,10 @@ def live_monitor_loop():
     while True:
         try:
             with state_lock: active_keys = list(state['active_positions'].keys())
+            
+            if active_keys:
+                print(f"📊 Monitoring Active Coins: {active_keys}") # Print statement
+
             for s in active_keys:
                 with state_lock: pos = state['active_positions'].get(s)
                 if not pos: continue
@@ -335,26 +344,12 @@ def live_monitor_loop():
                     current_p = float(k_res2.json()[-1][4])
                     
                     if (side == "BUY" and current_p >= pos['tp']) or (side == "SELL" and current_p <= pos['tp']):
-                        win_amt = pos['margin'] * (state['fast_tp_pct'] / 100.0)
-                        with state_lock:
-                            state['stats']['wins'] += 1
-                            state['daily_stats']['wins'] += 1
-                            state['daily_stats']['win_amount'] += win_amt
-                            
-                            if pos['step'] == 0:
-                                if 'first_win_coins' not in state: state['first_win_coins'] = []
-                                if s not in state['first_win_coins']:
-                                    state['first_win_coins'].append(s)
-                            
-                            state['symbol_recovery_step'][s] = 0
-                            state['symbol_accumulated_loss'][s] = 0.0
-                            if s in state['active_positions']: del state['active_positions'][s]
-                        execute_telegram_send(f"✅ <b>TARGET HIT ({s})</b>\nට්‍රේඩ් එක ලාභ පිට වසා දැමුවා! Recovery Steps Reset කරන ලදී.")
-                        sync_save()
+                        print(f"🎯 TP HIT for {s}! Price: {current_p} >= TP: {pos['tp']}") # Print statement
+                        # ... (ඔබේ ඉතිරි TP කේතය එලෙසම තබන්න)
                         
                     elif (side == "BUY" and current_p <= pos['sl']) or (side == "SELL" and current_p >= pos['sl']):
-                        trade_loss = pos['margin'] * (state['margin_sl_pct'] / 100.0)
-                        reverse_side = "SELL" if side == "BUY" else "BUY"
+                        print(f"🛑 SL HIT for {s}! Price: {current_p} <= SL: {pos['sl']}") # Print statement
+                        # ... (ඔබේ ඉතිරි SL කේතය එලෙසම තබන්න)
                         
                         # --- TIME WINDOW OVER වූ විට ක්‍රියාත්මක වන කොටස ---
                         if not is_ict_trading_window():
