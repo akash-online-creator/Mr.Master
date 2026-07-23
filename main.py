@@ -329,29 +329,104 @@ def execute_new_trade(s, side, current_p):
 def live_monitor_loop():
     while True:
         try:
-            with state_lock: active_keys = list(state['active_positions'].keys())
+            with state_lock: 
+                active_keys = list(state['active_positions'].keys())
             
             if active_keys:
-                print(f"📊 Monitoring Active Coins: {active_keys}") # Print statement
+                print(f"📊 Monitoring Active Coins: {active_keys}")
 
             for s in active_keys:
-                with state_lock: pos = state['active_positions'].get(s)
+                with state_lock: 
+                    pos = state['active_positions'].get(s)
                 if not pos: continue
+                
                 side = pos['side']
+                tp_price = pos['tp']
+                sl_price = pos['sl']
+                step = pos.get('step', 0)
+                margin = pos.get('margin', 0.80)
                 
                 try:
                     k_res2 = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=1", timeout=10)
                     current_p = float(k_res2.json()[-1][4])
                     
-                    if (side == "BUY" and current_p >= pos['tp']) or (side == "SELL" and current_p <= pos['tp']):
-                        print(f"🎯 TP HIT for {s}! Price: {current_p} >= TP: {pos['tp']}") # Print statement
-                        # ... (ඔබේ ඉතිරි TP කේතය එලෙසම තබන්න)
+                    is_tp = (side == "BUY" and current_p >= tp_price) or (side == "SELL" and current_p <= tp_price)
+                    is_sl = (side == "BUY" and current_p <= sl_price) or (side == "SELL" and current_p >= sl_price)
+                    
+                    # 🎯 TAKE PROFIT (WIN)
+                    if is_tp:
+                        print(f"🎯 TP HIT for {s}! Price: {current_p}")
+                        profit_amount = margin * (state.get('fast_tp_pct', 30.0) / 100.0)
                         
-                    elif (side == "BUY" and current_p <= pos['sl']) or (side == "SELL" and current_p >= pos['sl']):
-                        print(f"🛑 SL HIT for {s}! Price: {current_p} <= SL: {pos['sl']}") # Print statement
-                        # ... (ඔබේ ඉතිරි SL කේතය එලෙසම තබන්න)
-                except Exception as e:  # <-- මෙතන හිස්තැන් ගණන හරියටම පේළි ගැස්මට සකසා ඇත
-                    print(f"Error in live monitor loop: {e}")
+                        with state_lock:
+                            # Position එක අයින් කිරීම සහ Recovery step එක reset කිරීම
+                            del state['active_positions'][s]
+                            state['symbol_recovery_step'][s] = 0
+                            state['symbol_accumulated_loss'][s] = 0.0
+                            
+                            # Stats Update කිරීම
+                            state['stats']['wins'] += 1
+                            state['daily_stats']['wins'] += 1
+                            state['daily_stats']['win_amount'] += profit_amount
+                            
+                            if step == 0 and s not in state.get('first_win_coins', []):
+                                state['first_win_coins'].append(s)
+                        
+                        sync_save()
+                        
+                        tp_msg = (f"🎯 <b>TAKE PROFIT (WIN)!</b> 🟢\n\n"
+                                  f"📍 Coin: <code>{s}</code>\n"
+                                  f"💰 Profit: <b>+${round(profit_amount, 2)}</b>\n"
+                                  f"🏁 Exit Price: <code>{current_p}</code>\n"
+                                  f"🔄 Step: <b>{step}</b> (Reset to 0)")
+                        execute_telegram_send(tp_msg)
+
+                    # 🛑 STOP LOSS (LOSS)
+                    elif is_sl:
+                        print(f"🛑 SL HIT for {s}! Price: {current_p}")
+                        loss_amount = margin * (state.get('margin_sl_pct', 27.0) / 100.0)
+                        
+                        with state_lock:
+                            del state['active_positions'][s]
+                            new_step = step + 1
+                            
+                            # Stats Update කිරීම
+                            state['stats']['loss'] += 1
+                            state['daily_stats']['loss'] += 1
+                            state['daily_stats']['loss_amount'] += loss_amount
+                            
+                            # Step 3 පසුව රිකවරි සීමාව පැන්නොත් Blacklist කිරීම
+                            if new_step > 3:
+                                state['symbol_recovery_step'][s] = 0
+                                state['symbol_accumulated_loss'][s] = 0.0
+                                if s not in state['block_list']:
+                                    state['block_list'].append(s)
+                                if s not in state['daily_stats']['blacklist_coins']:
+                                    state['daily_stats']['blacklist_coins'].append(s)
+                                    
+                                sl_msg = (f"🛑 <b>MAX RECOVERY FAILED (LOSS)!</b> 🔴\n\n"
+                                          f"📍 Coin: <code>{s}</code>\n"
+                                          f"💸 Loss: <b>-${round(loss_amount, 2)}</b>\n"
+                                          f"🏁 Exit Price: <code>{current_p}</code>\n"
+                                          f"🚫 Step 3 ඉක්මවා ඇති බැවින් මෙම කාසිය Blacklist කරන ලදී.")
+                            else:
+                                state['symbol_recovery_step'][s] = new_step
+                                state['symbol_accumulated_loss'][s] = state['symbol_accumulated_loss'].get(s, 0.0) + loss_amount
+                                
+                                sl_msg = (f"🛑 <b>STOP LOSS HIT (LOSS)!</b> 🔴\n\n"
+                                          f"📍 Coin: <code>{s}</code>\n"
+                                          f"💸 Loss: <b>-${round(loss_amount, 2)}</b>\n"
+                                          f"🏁 Exit Price: <code>{current_p}</code>\n"
+                                          f"🔄 Next Step: <b>Step {new_step}</b> සඳහා සූදානම් වේ.")
+                        
+                        sync_save()
+                        execute_telegram_send(sl_msg)
+
+                except Exception as e:
+                    print(f"Error checking price for {s}: {e}")
+                    
+            time.sleep(3) # Loop එක දිගටම run වීමට 
+            
         except Exception as global_e:
             print(f"Global Error in live monitor: {global_e}")
             time.sleep(10)
