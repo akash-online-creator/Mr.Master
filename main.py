@@ -25,9 +25,6 @@ client.API_URL = 'https://fapi.binance.com'
 app = Flask(__name__)
 DB_FILE = "trade_state.json"
 
-# Active Signal Reminder Tracking System
-pending_reminders = {}
-
 # --- 2. STATE MANAGEMENT & DATABASE ---
 def load_data():
     default_state = {
@@ -45,7 +42,7 @@ def load_data():
         'direct_mode': False,
         'recovery_only_mode': False,     
         
-        'first_win_list': [],          
+        'first_win_list': [],         
         'first_win_coins': [], 
         'shared_loss_buffer': 0.0,       
         'shared_loss_splits': 0,         
@@ -64,7 +61,11 @@ def load_data():
         'fw_start_hour': 0,
         'fw_start_minute': 0,
         'fw_end_hour': 8,
-        'fw_end_minute': 0
+        'fw_end_minute': 0,
+
+        # Reminder alerts feature variables
+        'reminder_enabled': True,
+        'active_reminders': {}  # {signal_num: True/False}
     }
     if os.path.exists(DB_FILE):
         try:
@@ -110,20 +111,25 @@ def is_ict_trading_window():
         return start_time <= total_minutes <= end_time
     except: return True
 
-# --- 🔔 REMINDER WORKER (1 Minute Alert Loop) ---
-def reminder_worker_thread(s, signal_num):
+# --- ⏰ REMINDER THREAD WORKER ---
+def signal_reminder_thread(signal_num, symbol, side, price):
+    """විනාඩියෙන් විනාඩියට මතක් කිරීමේ පණිවිඩය යවන Thread එක"""
+    time.sleep(60) # පළමු මතක් කිරීම විනාඩියකට පසුව
+    
     while True:
-        time.sleep(60)  # විනාඩියෙන් විනාඩියට මතක් කිරීම
         with state_lock:
-            # Trade එක තවමත් Active ද සහ Reminder එක Acknowledge නොකර තිබේදැයි බලයි
-            if s not in state['active_positions'] or pending_reminders.get(s) != signal_num:
-                break
-        
-        msg = (f"⏰ <b>SIGNAL REMINDER ALERT!</b> 🔔\n\n"
-               f"📍 Coin: <code>{s}</code> (Signal #{signal_num:02d})\n"
-               f"⚠️ මෙම ට්‍රේඩ් එක තවමත් තහවුරු කර නොමැත!\n"
-               f"👉 මතක් කිරීම් නවත්වන්න <b>/ok</b> ලෙස රෙප්ලයි කරන්න.")
+            is_enabled = state.get('reminder_enabled', True)
+            is_active = state.get('active_reminders', {}).get(str(signal_num), False)
+            
+        if not is_enabled or not is_active:
+            break  # Reminder Off කර ඇත්නම් හෝ /ok ලබා දී ඇත්නම් Loop එක නතර වේ.
+
+        msg = (f"⏰ <b>SIGNAL REMINDER (#{signal_num:02d})</b> 🔔\n\n"
+               f"📍 Coin: <code>{symbol}</code> | Direction: <b>{side}</b>\n"
+               f"💵 Price: <code>{price}</code>\n\n"
+               f"👉 මෙම Alert එක නවතාලීමට <code>/ok</code> ලෙස Type කරන්න.")
         execute_telegram_send(msg)
+        time.sleep(60) # විනාඩියක් ඉන්නවා
 
 # --- 📊 PIVOT HIGH / LOW INDICATOR ---
 def calculate_pivots(df, left=14, right=14):
@@ -265,7 +271,7 @@ def scan_markets():
                                 curr_p = float(k_res.json()[-1][4])
                                 print(f"🔄 Resuming recovery for {s} at Step {step}")
                                 execute_new_trade(s, "BUY", curr_p)
-                                # 🛑 (කරදරකාරී RESUMING RECOVERY මැසේජ් එක නතර කර ඇත)
+                                # ❌ RESUMING RECOVERY Message Disabled Here as Requested
                                 time.sleep(2)
                             except:
                                 pass
@@ -329,24 +335,27 @@ def execute_new_trade(s, side, current_p):
     with state_lock:
         state['active_positions'][s] = {
             "symbol": s, "side": side, "entry_price": current_p, "margin": current_margin,
-            "step": step, "tp": initial_tp, "sl": initial_sl, "timestamp": time.time()
+            "step": step, "tp": initial_tp, "sl": initial_sl, "timestamp": time.time(),
+            "signal_num": signal_num
         }
-        # Reminder එක Register කරගැනීම
-        pending_reminders[s] = signal_num
+        # Enable Reminder tracking for this signal
+        if 'active_reminders' not in state: state['active_reminders'] = {}
+        state['active_reminders'][str(signal_num)] = True
         
-    msg = (f"🔔 <b>NEW TRADING SIGNAL  {signal_num:02d}</b> 🚨\n\n"
+    msg = (f"🔔 <b>NEW TRADING SIGNAL #{signal_num:02d}</b> 🚨\n\n"
            f"📍 Coin: <code>{s}</code> | Direction: <b>{side}</b>\n"
            f"💵 Margin: <b>${current_margin}</b> | Leverage: <b>{leverage}x</b>\n"
            f"🎯 Target TP: <code>{round(initial_tp, 5)}</code>\n"
            f"🛑 Target SL: <code>{round(initial_sl, 5)}</code>\n"
            f"🔄 Step: <b>{step}/3</b>\n"
            f"📊 Accum. Loss: <b>${round(accumulated_loss, 2)}</b>\n\n"
-           f"🛑 මතක් කිරීම් නතර කිරීමට <b>/ok</b> ලෙස රෙප්ලයි කරන්න.")
+           f"💡 <i>Alerts නතර කිරීමට <b>/ok</b> ලෙස Type කරන්න.</i>")
     execute_telegram_send(msg)
     sync_save()
 
-    # Reminder Thread එක ආරම්භ කිරීම
-    threading.Thread(target=reminder_worker_thread, args=(s, signal_num), daemon=True).start()
+    # Start Background Thread for Minute Reminders
+    if state.get('reminder_enabled', True):
+        threading.Thread(target=signal_reminder_thread, args=(signal_num, s, side, current_p), daemon=True).start()
 
 # --- 🔄 LIVE MONITOR & AUTO-REVERSE ---
 def live_monitor_loop():
@@ -368,6 +377,7 @@ def live_monitor_loop():
                 sl_price = pos['sl']
                 step = pos.get('step', 0)
                 margin = pos.get('margin', 0.80)
+                signal_num = pos.get('signal_num', None)
                 
                 try:
                     k_res2 = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=1", timeout=10)
@@ -392,9 +402,10 @@ def live_monitor_loop():
                             
                             if step == 0 and s not in state.get('first_win_coins', []):
                                 state['first_win_coins'].append(s)
-                                
-                            if s in pending_reminders:
-                                del pending_reminders[s]
+                            
+                            # Cancel reminder if active
+                            if signal_num and str(signal_num) in state.get('active_reminders', {}):
+                                state['active_reminders'][str(signal_num)] = False
                         
                         sync_save()
                         
@@ -418,8 +429,9 @@ def live_monitor_loop():
                             state['daily_stats']['loss'] += 1
                             state['daily_stats']['loss_amount'] += loss_amount
                             
-                            if s in pending_reminders:
-                                del pending_reminders[s]
+                            # Cancel reminder if active
+                            if signal_num and str(signal_num) in state.get('active_reminders', {}):
+                                state['active_reminders'][str(signal_num)] = False
                             
                             # Step 3 පසුව රිකවරි සීමාව පැන්නොත් Blacklist කිරීම
                             if new_step > 3:
@@ -444,7 +456,7 @@ def live_monitor_loop():
                             else:
                                 state['symbol_recovery_step'][s] = new_step
                                 state['symbol_accumulated_loss'][s] = state['symbol_accumulated_loss'].get(s, 0.0) + loss_amount
-                                # 🛑 (කරදරකාරී සාමාන්‍ය STOP LOSS HIT මැසේජ් එක නතර කර ඇත)
+                                # ❌ STOP LOSS HIT Message Disabled Here as Requested
                         
                         sync_save()
 
@@ -492,14 +504,25 @@ def telegram_webhook():
             tokens = str(raw_text).strip().split()
             cmd = tokens[0].lower().replace("/", "")
             
-            # --- 🛑 REMINDER OK ACKNOWLEDGEMENT ---
+            # --- 🛑 REMINDER STOP COMMAND (/ok) ---
             if cmd == "ok":
                 with state_lock:
-                    if pending_reminders:
-                        pending_reminders.clear()
-                        execute_telegram_send("✅ <b>මතක් කිරීම් සාර්ථකව නතර කරන ලදී!</b>")
-                    else:
-                        execute_telegram_send("ℹ️ දැනට සක්‍රීය Reminder Alert කිසිවක් නොමැත.")
+                    if 'active_reminders' in state:
+                        for k in state['active_reminders']:
+                            state['active_reminders'][k] = False
+                sync_save()
+                execute_telegram_send("✅ <b>Signal Reminder නවතාලන ලදී!</b>")
+
+            # --- ⚙️ REMINDER ON/OFF COMMANDS ---
+            elif cmd == "reminder_on":
+                with state_lock: state['reminder_enabled'] = True
+                sync_save()
+                execute_telegram_send("🟢 <b>Minute Reminder Alert System එක සක්‍රීය කරන ලදී.</b>")
+
+            elif cmd == "reminder_off":
+                with state_lock: state['reminder_enabled'] = False
+                sync_save()
+                execute_telegram_send("🔴 <b>Minute Reminder Alert System එක අක්‍රීය කරන ලදී.</b>")
 
             elif cmd == "bot_on":
                 with state_lock: state['is_paused'] = False
@@ -541,12 +564,13 @@ def telegram_webhook():
                     
                     fw_coins = state.get('first_win_coins', [])
                     fw_coins_str = " ".join(fw_coins) if fw_coins else "None"
+                    rem_status = "සක්‍රීයයි 🟢" if state.get('reminder_enabled', True) else "අක්‍රීයයි 🔴"
                     
                     msg = (f"ℹ️ <b>[RED BULL MASTER STATUS REPORT]</b>\n"
                            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                            f"▶️ ස්කෑනර් එන්ජිම: <b>{'අක්‍රීයයි (OFF)' if state.get('is_paused') else 'සක්‍රීයයි (ON)'}</b>\n"
                            f"🔥 Active ට්‍රේඩ් ගණන: <b>{len(state['active_positions'])} / {state.get('max_signals', 10)}</b>\n"
-                           f"📢 මතක් කිරීමේ පද්ධතිය: <b>සක්‍රීයයි 🔔</b>\n"
+                           f"📢 මතක් කිරීමේ පද්ධතිය: <b>{rem_status}</b>\n"
                            f"⚙️ Mode: <b>{mode_str}</b>\n"
                            f"⏱️ BOT WINDOW STATUS : <b>{'OFFLINE 🔴' if state.get('is_paused') else 'ONLINE 🟢'}</b>\n"
                            f"⏰ සිග්නල් දෙන කාලය: <b>{start_t} - {end_t} දක්වා.</b>\n"
@@ -566,8 +590,10 @@ def telegram_webhook():
                             "<b>1. මූලික පාලන විධානයන් (Basic Controls)</b>\n"
                             "• /bot_on : බොට් සක්‍රීය කරයි.\n"
                             "• /bot_off : බොට් තාවකාලිකව අක්‍රීය කරයි.\n"
+                            "• /ok : Alert Reminder පද්ධතිය නවතාලයි.\n"
+                            "• /reminder_on : Reminder Alert පද්ධතිය ON කරයි.\n"
+                            "• /reminder_off : Reminder Alert පද්ධතිය OFF කරයි.\n"
                             "• /status : බොට්ගේ වත්මන් තත්ත්වය පෙන්වයි.\n"
-                            "• /ok : පවතින Reminder Alerts නතර කරයි.\n"
                             "• /set_max_signals [NUMBER] : එකවර ගත හැකි උපරිම ට්‍රේඩ් ගණන වෙනස් කරයි.\n"
                             "• /menu : ප්‍රධාන විධානයන් ලැයිස්තුව ගෙන්වා ගනී.\n\n"
                             "<b>2. මාදිලි මාරු කිරීම (Mode Switching)</b>\n"
@@ -686,9 +712,7 @@ def telegram_webhook():
                 except: pass
 
             elif cmd == "reset_trades":
-                with state_lock: 
-                    state['active_positions'] = {}
-                    pending_reminders.clear()
+                with state_lock: state['active_positions'] = {}
                 sync_save(); execute_telegram_send("🗑️ සියලුම ක්‍රියාකාරී ට්‍රේඩ් දත්ත පද්ධතියෙන් මකා දමන ලදී.")
 
     except: pass
