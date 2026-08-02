@@ -307,6 +307,7 @@ def execute_new_trade(s, side, current_p):
         current_margin = state.get('base_margin', 0.80)
         sl_margin_pct = state.get('margin_sl_pct', 27.0)
         leverage = state.get('leverage', 10)
+        bh_balance_set = state.get('blacklist_balance_set', 0.10)
         
     if step == 0 and state.get('total_loss_cost', 0.0) >= 0.15:
         accumulated_loss += 0.15
@@ -318,18 +319,18 @@ def execute_new_trade(s, side, current_p):
     if side == "BUY":
         initial_sl = current_p * (1.0 - coin_sl_move_pct)
         if step == 0:
-            required_move_pct = (current_margin * (state.get('fast_tp_pct', 30.0) / 100.0)) / position_size
+            required_move_pct = (current_margin * (state.get('fast_tp_pct', 30.0) / 100.0) + bh_balance_set) / position_size
             initial_tp = current_p * (1.0 + required_move_pct)
         else:
-            required_move_pct = (accumulated_loss + 0.10 + (position_size * 0.0008)) / position_size
+            required_move_pct = (accumulated_loss + bh_balance_set + (position_size * 0.0008)) / position_size
             initial_tp = current_p * (1.0 + required_move_pct)
     else:
         initial_sl = current_p * (1.0 + coin_sl_move_pct)
         if step == 0:
-            required_move_pct = (current_margin * (state.get('fast_tp_pct', 30.0) / 100.0)) / position_size
+            required_move_pct = (current_margin * (state.get('fast_tp_pct', 30.0) / 100.0) + bh_balance_set) / position_size
             initial_tp = current_p * (1.0 - required_move_pct)
         else:
-            required_move_pct = (accumulated_loss + 0.10 + (position_size * 0.0008)) / position_size
+            required_move_pct = (accumulated_loss + bh_balance_set + (position_size * 0.0008)) / position_size
             initial_tp = current_p * (1.0 - required_move_pct)
             
     with state_lock:
@@ -432,15 +433,25 @@ def live_monitor_loop():
                             # Cancel reminder if active
                             if signal_num and str(signal_num) in state.get('active_reminders', {}):
                                 state['active_reminders'][str(signal_num)] = False
-                            
+                                
                             # Step 3 පසුව රිකවරි සීමාව පැන්නොත් Blacklist කිරීම
                             if new_step > 3:
-                                state['symbol_recovery_step'][s] = 0
-                                state['symbol_accumulated_loss'][s] = 0.0
-                                if s not in state['block_list']:
-                                    state['block_list'].append(s)
-                                if s not in state['daily_stats']['blacklist_coins']:
-                                    state['daily_stats']['blacklist_coins'].append(s)
+                            # --- මෙන්න අලුතෙන් එකතු කළ යුතු කොටස ---
+                            est_fee = margin * 0.0008 * leverage 
+                            total_blacklist_loss = loss_amount + est_fee
+                
+                    with state_lock:
+                    state['shared_loss_buffer'] += total_blacklist_loss
+                    state['total_loss_cost'] += total_blacklist_loss
+                # ----------------------------------------
+                
+                state['symbol_recovery_step'][s] = 0
+                state['symbol_accumulated_loss'][s] = 0.0
+                if s not in state['block_list']:
+                    state['block_list'].append(s)
+                if s not in state['daily_stats']['blacklist_coins']:
+                    state['daily_stats']['blacklist_coins'].append(s)
+
                                     
                                 if s in state.get('first_win_list', []):
                                     state['first_win_list'].remove(s)
@@ -503,6 +514,7 @@ def telegram_webhook():
         if str(chat_id).strip() == str(TELEGRAM_CHAT_ID).strip() and raw_text:
             tokens = str(raw_text).strip().split()
             cmd = tokens[0].lower().replace("/", "")
+            text = str(raw_text).strip()
             
             # --- 🛑 REMINDER STOP COMMAND (/ok) ---
             if cmd == "ok":
@@ -615,7 +627,10 @@ def telegram_webhook():
                             "• /symbol_scanner : මුළු Binance වෙළඳපොළම ස්කෑන් කිරීම ආරම්භ කරයි.\n"
                             "• /set_signal_time [START] [END] : සිග්නල් සෙවිය යුතු කාලය සකසයි.\n"
                             "• /set_fw_time [START] [END] : FW Scanner ක්‍රියාත්මක විය යුතු කාලය සකසයි.\n"
-                            "• /reset_trades : පවතින Active Trades දත්ත පද්ධතියෙන් මකා දමයි.")
+                            "• /reset_trades : පවතින Active Trades දත්ත පද්ධතියෙන් මකා දමයි.\n\n"
+                            "<b>6. Buffer & Blacklist Settings</b>\n"
+                            "• /blacklist_balance_set [VALUE] : Blacklist balance set අගය වෙනස් කරයි.\n"
+                            "• /buffer_status : බෆර් සහ බ්ලැක්ලිස්ට් තත්ත්වය පෙන්වයි.")
                 execute_telegram_send(menu_msg)
 
             elif cmd == "direct_mode_on":
@@ -714,8 +729,38 @@ def telegram_webhook():
             elif cmd == "reset_trades":
                 with state_lock: state['active_positions'] = {}
                 sync_save(); execute_telegram_send("🗑️ සියලුම ක්‍රියාකාරී ට්‍රේඩ් දත්ත පද්ධතියෙන් මකා දමන ලදී.")
+                
+            elif text.startswith('/blacklist_balance_set'):
+                try:
+                    parts = text.split()
+                    if len(parts) > 1:
+                        new_val = float(parts[1])
+                        with state_lock:
+                            state['blacklist_balance_set'] = new_val
+                        sync_save()
+                        execute_telegram_send(f"✅ Blacklist balance set updated to: {new_val}")
+                    else:
+                        current_val = state.get('blacklist_balance_set', 0.10)
+                        execute_telegram_send(f"ℹ️ Current blacklist balance set: {current_val}\nUsage: /blacklist_balance_set 0.10")
+                except Exception as e:
+                    execute_telegram_send(f"❌ Error: {e}")
 
-    except: pass
+            elif cmd == "buffer_status" or text.startswith('/buffer_status') or text.startswith('/blacklist_amount'):
+                with state_lock:
+                    buf = state.get('shared_loss_buffer', 0.0)
+                    tot_cost = state.get('total_loss_cost', 0.0)
+                    bh_set = state.get('blacklist_balance_set', 0.10)
+                
+                msg = (
+                    f"📊 <b>Buffer & Blacklist Status</b>\n\n"
+                    f"🔹 Shared Loss Buffer: <code>{round(buf, 4)}</code>\n"
+                    f"🔹 Total Loss Cost: <code>{round(tot_cost, 4)}</code>\n"
+                    f"🔹 Blacklist Balance Set (TP Extra): <code>{round(bh_set, 4)}</code>"
+                )
+                execute_telegram_send(msg)
+
+    except Exception as e:
+        print(f"Webhook Error: {e}")
     return "OK", 200
 
 @app.route('/', methods=['GET'])
