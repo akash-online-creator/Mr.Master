@@ -271,7 +271,6 @@ def scan_markets():
                                 curr_p = float(k_res.json()[-1][4])
                                 print(f"🔄 Resuming recovery for {s} at Step {step}")
                                 execute_new_trade(s, "BUY", curr_p)
-                                # ❌ RESUMING RECOVERY Message Disabled Here as Requested
                                 time.sleep(2)
                             except:
                                 pass
@@ -339,7 +338,6 @@ def execute_new_trade(s, side, current_p):
             "step": step, "tp": initial_tp, "sl": initial_sl, "timestamp": time.time(),
             "signal_num": signal_num
         }
-        # Enable Reminder tracking for this signal
         if 'active_reminders' not in state: state['active_reminders'] = {}
         state['active_reminders'][str(signal_num)] = True
         
@@ -354,7 +352,6 @@ def execute_new_trade(s, side, current_p):
     execute_telegram_send(msg)
     sync_save()
 
-    # Start Background Thread for Minute Reminders
     if state.get('reminder_enabled', True):
         threading.Thread(target=signal_reminder_thread, args=(signal_num, s, side, current_p), daemon=True).start()
 
@@ -379,6 +376,7 @@ def live_monitor_loop():
                 step = pos.get('step', 0)
                 margin = pos.get('margin', 0.80)
                 signal_num = pos.get('signal_num', None)
+                leverage = state.get('leverage', 10)
                 
                 try:
                     k_res2 = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=1", timeout=10)
@@ -393,7 +391,8 @@ def live_monitor_loop():
                         profit_amount = margin * (state.get('fast_tp_pct', 30.0) / 100.0)
                         
                         with state_lock:
-                            del state['active_positions'][s]
+                            if s in state['active_positions']:
+                                del state['active_positions'][s]
                             state['symbol_recovery_step'][s] = 0
                             state['symbol_accumulated_loss'][s] = 0.0
                             
@@ -404,7 +403,6 @@ def live_monitor_loop():
                             if step == 0 and s not in state.get('first_win_coins', []):
                                 state['first_win_coins'].append(s)
                             
-                            # Cancel reminder if active
                             if signal_num and str(signal_num) in state.get('active_reminders', {}):
                                 state['active_reminders'][str(signal_num)] = False
                         
@@ -423,35 +421,30 @@ def live_monitor_loop():
                         loss_amount = margin * (state.get('margin_sl_pct', 27.0) / 100.0)
                         
                         with state_lock:
-                            del state['active_positions'][s]
+                            if s in state['active_positions']:
+                                del state['active_positions'][s]
                             new_step = step + 1
                             
                             state['stats']['loss'] += 1
                             state['daily_stats']['loss'] += 1
                             state['daily_stats']['loss_amount'] += loss_amount
                             
-                            # Cancel reminder if active
                             if signal_num and str(signal_num) in state.get('active_reminders', {}):
                                 state['active_reminders'][str(signal_num)] = False
                                 
-                            # Step 3 පසුව රිකවරි සීමාව පැන්නොත් Blacklist කිරීම
                             if new_step > 3:
-                            # --- මෙන්න අලුතෙන් එකතු කළ යුතු කොටස ---
-                            est_fee = margin * 0.0008 * leverage 
-                            total_blacklist_loss = loss_amount + est_fee
+                                est_fee = margin * 0.0008 * leverage 
+                                total_blacklist_loss = loss_amount + est_fee
+                    
+                                state['shared_loss_buffer'] += total_blacklist_loss
+                                state['total_loss_cost'] += total_blacklist_loss
                 
-                    with state_lock:
-                    state['shared_loss_buffer'] += total_blacklist_loss
-                    state['total_loss_cost'] += total_blacklist_loss
-                # ----------------------------------------
-                
-                state['symbol_recovery_step'][s] = 0
-                state['symbol_accumulated_loss'][s] = 0.0
-                if s not in state['block_list']:
-                    state['block_list'].append(s)
-                if s not in state['daily_stats']['blacklist_coins']:
-                    state['daily_stats']['blacklist_coins'].append(s)
-
+                                state['symbol_recovery_step'][s] = 0
+                                state['symbol_accumulated_loss'][s] = 0.0
+                                if s not in state['block_list']:
+                                    state['block_list'].append(s)
+                                if s not in state['daily_stats']['blacklist_coins']:
+                                    state['daily_stats']['blacklist_coins'].append(s)
                                     
                                 if s in state.get('first_win_list', []):
                                     state['first_win_list'].remove(s)
@@ -467,7 +460,6 @@ def live_monitor_loop():
                             else:
                                 state['symbol_recovery_step'][s] = new_step
                                 state['symbol_accumulated_loss'][s] = state['symbol_accumulated_loss'].get(s, 0.0) + loss_amount
-                                # ❌ STOP LOSS HIT Message Disabled Here as Requested
                         
                         sync_save()
 
@@ -516,7 +508,6 @@ def telegram_webhook():
             cmd = tokens[0].lower().replace("/", "")
             text = str(raw_text).strip()
             
-            # --- 🛑 REMINDER STOP COMMAND (/ok) ---
             if cmd == "ok":
                 with state_lock:
                     if 'active_reminders' in state:
@@ -525,7 +516,6 @@ def telegram_webhook():
                 sync_save()
                 execute_telegram_send("✅ <b>Signal Reminder නවතාලන ලදී!</b>")
 
-            # --- ⚙️ REMINDER ON/OFF COMMANDS ---
             elif cmd == "reminder_on":
                 with state_lock: state['reminder_enabled'] = True
                 sync_save()
