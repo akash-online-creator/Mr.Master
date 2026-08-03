@@ -179,7 +179,8 @@ def run_symbol_scanner_process():
             
             try:
                 time.sleep(0.3) 
-                k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=500", timeout=15)
+                # Process limit 1500 වෙත සකසා ඇත
+                k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=1500", timeout=15)
                 if k_res.status_code != 200: continue
                 
                 df = pd.DataFrame(k_res.json(), columns=['t','open','high','low','close','v','ct','qv','nt','tb','tq','i'])
@@ -226,7 +227,8 @@ def run_symbol_scanner_process():
 # --- 📈 DATA ANALYSIS & INDICATOR LOGIC ---
 def analyze_and_check_signal(s):
     try:
-        k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=600", timeout=10)
+        # Process limit 1500 වෙත සකසා ඇත
+        k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=1500", timeout=10)
         raw_data = k_res.json()
         if not isinstance(raw_data, list) or len(raw_data) < 250:
             return "NONE", 0.0
