@@ -178,19 +178,15 @@ def run_symbol_scanner_process():
                 if s in state.get('block_list', []): continue
             
             try:
-                time.sleep(0.3) # Rate limit protection
-                # Binance API limit is 1500 max per request
-                k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=1500", timeout=15)
-                raw_data = k_res.json()
-                if not isinstance(raw_data, list) or len(raw_data) < 250:
-                    continue
+                time.sleep(0.3) 
+                # limit එක 5000 වෙනුවට 500 දක්වා අඩු කිරීම මඟින් API Timeout සහ දෝෂ වළකාගත හැක
+                k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=500", timeout=15)
+                if k_res.status_code != 200: continue
                 
-                df = pd.DataFrame(raw_data, columns=['t','open','high','low','close','v','ct','qv','nt','tb','tq','i'])
-                df['close'] = df['close'].astype(float)
-                df['high'] = df['high'].astype(float)
-                df['low'] = df['low'].astype(float)
-                
-                closes = df['close']
+                df = pd.DataFrame(k_res.json(), columns=['t','open','high','low','close','v','ct','qv','nt','tb','tq','i'])
+                if len(df) < 200: continue
+
+                closes = df['close'].astype(float)
                 df['ema50'] = closes.ewm(span=50, adjust=False).mean()
                 df['ema100'] = closes.ewm(span=100, adjust=False).mean()
                 df['ema200'] = closes.ewm(span=200, adjust=False).mean()
@@ -212,8 +208,7 @@ def run_symbol_scanner_process():
                 else:
                     with state_lock:
                         if s not in state['block_list']: state['block_list'].append(s)
-            except Exception as e: 
-                print(f"Scanner item error for {s}: {e}")
+            except: pass
                 
         with state_lock:
             state['first_win_list'] = new_fwl
