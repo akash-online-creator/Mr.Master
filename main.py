@@ -36,6 +36,7 @@ def load_data():
         'is_paused': False,
         'is_scanning': True,
         'max_signals': 10,
+        'min_quote_volume': 40000000.0, # පෙරනිමි අවම පරිමාව ($40M)
         'stats': {'wins': 0, 'loss': 0, 'total_pnl': 0.0, 'blacklist_coins': []},
         'daily_stats': {'wins': 0, 'loss': 0, 'win_amount': 0.0, 'loss_amount': 0.0, 'blacklist_coins': [], 'last_reset_date': str(datetime.date.today())},
         
@@ -160,7 +161,7 @@ def calculate_pivots(df, left=14, right=14):
 
 # --- 🔍 STEP 1: SYMBOL SCANNER (FWL GENERATION) ---
 def run_symbol_scanner_process():
-    execute_telegram_send("🔍 <b>Binance Futures Scanner එක ආරම්භ කළා...</b>\nපැය 24 පරිමාව $40M වැඩි කාසි පරීක්ෂා කරමින් පවතී.")
+    execute_telegram_send("🔍 <b>Binance Futures Scanner එක ආරම්භ කළා...</b>\nසියලුම USDT කාසි පරීක්ෂා කරමින් පවතී.")
     try:
         res = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
         all_coins = res.json()
@@ -168,8 +169,7 @@ def run_symbol_scanner_process():
         filtered_by_vol = []
         for ticker in all_coins:
             symbol = ticker['symbol']
-            volume = float(ticker.get('quoteVolume', 0))
-            if symbol.endswith("USDT") and volume >= 40000000:
+            if symbol.endswith("USDT"):
                 filtered_by_vol.append(symbol)
                 
         new_fwl = []
@@ -179,8 +179,7 @@ def run_symbol_scanner_process():
             
             try:
                 time.sleep(0.3) 
-                # Process limit 1500 වෙත සකසා ඇත
-                k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=1500", timeout=15)
+                k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=500", timeout=15)
                 if k_res.status_code != 200: continue
                 
                 df = pd.DataFrame(k_res.json(), columns=['t','open','high','low','close','v','ct','qv','nt','tb','tq','i'])
@@ -219,7 +218,6 @@ def run_symbol_scanner_process():
             state['first_win_list'] = new_fwl
         sync_save()
         
-        fwl_str = " ".join(new_fwl)
         execute_telegram_send(f"✅ <b>Scanner Complete!</b>\n\n/fwl_view")
     except Exception as e:
         execute_telegram_send(f"❌ Scanner Error: {str(e)}")
@@ -227,8 +225,17 @@ def run_symbol_scanner_process():
 # --- 📈 DATA ANALYSIS & INDICATOR LOGIC ---
 def analyze_and_check_signal(s):
     try:
-        # Process limit 1500 වෙත සකසා ඇත
-        k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=1500", timeout=10)
+        # සිග්නල් පරීක්ෂා කිරීමේදී 24 පැය පරිමාව (Quote Volume) පරීක්ෂා කිරීම
+        t_res = requests.get(f"https://fapi.binance.com/fapi/v1/ticker/24hr?symbol={s}", timeout=10)
+        if t_res.status_code == 200:
+            ticker_data = t_res.json()
+            q_volume = float(ticker_data.get('quoteVolume', 0))
+            with state_lock:
+                min_vol = state.get('min_quote_volume', 40000000.0)
+            if q_volume < min_vol:
+                return "NONE", 0.0
+
+        k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=600", timeout=10)
         raw_data = k_res.json()
         if not isinstance(raw_data, list) or len(raw_data) < 250:
             return "NONE", 0.0
@@ -564,13 +571,14 @@ def telegram_webhook():
                     end_t = f"{state.get('end_hour', 23):02d}:{state.get('end_minute', 59):02d}"
                     fwl_list = state.get('first_win_list', [])
                     fw_coins = state.get('first_win_coins', [])
-                    fw_coins_str = " ".join(fw_coins) if fw_coins else "None"
                     rem_status = "ON 🟢" if state.get('reminder_enabled', True) else "OFF 🔴"
+                    min_vol_val = state.get('min_quote_volume', 40000000.0)
                     
                     msg = (f"ℹ️ <b>[RED BULL MASTER STATUS REPORT]</b>\n"
                            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                            f"▶️ ස්කෑනර් එන්ජිම: <b>{'OFF 🔴' if state.get('is_paused') else 'ON 🟢'}</b>\n"
                            f"🔥 Active ට්‍රේඩ් ගණන: <b>{len(state['active_positions'])} / {state.get('max_signals', 10)}</b>\n"
+                           f"📊 අවම 24h පරිමාව: <b>${min_vol_val:,.0f}</b>\n"
                            f"📢 Reminder පද්ධතිය: <b>{rem_status}</b>\n"
                            f"⚙️ Mode: <b>{mode_str}</b>\n"
                            f"⏰ සිග්නල් දෙන කාලය: <b>{start_t} - {end_t}</b>\n"
@@ -591,6 +599,15 @@ def telegram_webhook():
                 except Exception:
                     execute_telegram_send("❌ දෝෂයකි! නිවැරදි අංකයක් දෙන්න. (උදා: /set_max_signals 15)")
 
+            elif cmd == "set_min_volume" and len(tokens) > 1:
+                try:
+                    new_vol = float(tokens[1])
+                    with state_lock: state['min_quote_volume'] = new_vol
+                    sync_save()
+                    execute_telegram_send(f"⚙️ අවම 24h පරිමාව ${new_vol:,.0f} ලෙස සාර්ථකව වෙනස් කරන ලදී.")
+                except Exception:
+                    execute_telegram_send("❌ දෝෂයකි! නිවැරදි අංකයක් දෙන්න. (උදා: /set_min_volume 20000000)")
+
             elif cmd == "menu":
                 menu_msg = (
                     "📜 <b>RED BULL MASTER COMMANDS MENU</b>\n"
@@ -603,6 +620,7 @@ def telegram_webhook():
                     "• /reminder_off : Reminder Alert පද්ධතිය OFF කරයි.\n"
                     "• /status : බොට්ගේ වත්මන් තත්ත්වය පෙන්වයි.\n"
                     "• /set_max_signals [NUMBER] : උපරිම ට්‍රේඩ් ගණන වෙනස් කරයි.\n"
+                    "• /set_min_volume [AMOUNT] : අවම 24h පරිමාව වෙනස් කරයි.\n"
                     "• /menu : ප්‍රධාන විධානයන් ලැයිස්තුව ගෙන්වා ගනී.\n\n"
                     "<b>2. මාදිලි මාරු කිරීම (Mode Switching)</b>\n"
                     "• /direct_mode_on : Direct Mode සක්‍රීය කරයි.\n"
