@@ -4,6 +4,7 @@ import json
 import threading
 import requests
 import datetime
+import traceback
 import pandas as pd
 import numpy as np
 from binance.client import Client
@@ -24,6 +25,35 @@ client.API_URL = 'https://fapi.binance.com'
 
 app = Flask(__name__)
 DB_FILE = "trade_state.json"
+
+# --- 🚨 ERROR NOTIFICATION HELPER ---
+def execute_telegram_send(msg):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": str(TELEGRAM_CHAT_ID).strip(), "text": msg, "parse_mode": "HTML"}
+    for attempt in range(3):
+        try:
+            res = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=15)
+            if res.status_code == 200: return True
+            elif res.status_code == 429:
+                retry_after = res.json().get('parameters', {}).get('retry_after', 5)
+                time.sleep(retry_after)
+        except:
+            time.sleep(2)
+    return False
+
+def notify_error(context_msg, error_obj):
+    """දෝෂයක් සිදු වූ විට Telegram වෙත ක්ෂණිකව දන්වයි"""
+    try:
+        tb_str = traceback.format_exc()
+        error_msg = (
+            f"❌ <b>CRITICAL BOT ERROR!</b> 🚨\n\n"
+            f"📍 <b>Context:</b> {context_msg}\n"
+            f"💬 <b>Error:</b> <code>{str(error_obj)}</code>\n\n"
+            f"📜 <b>Traceback:</b>\n<pre>{tb_str[-1000:]}</pre>"
+        )
+        execute_telegram_send(error_msg)
+    except Exception as e:
+        print(f"Failed to send error notification: {e}")
 
 # --- 2. STATE MANAGEMENT & DATABASE ---
 def load_data():
@@ -63,9 +93,8 @@ def load_data():
         'fw_end_hour': 8,
         'fw_end_minute': 0,
 
-        # Reminder alerts feature variables
         'reminder_enabled': True,
-        'active_reminders': {}  # {signal_num: True/False}
+        'active_reminders': {}
     }
     if os.path.exists(DB_FILE):
         try:
@@ -74,7 +103,8 @@ def load_data():
                 for k, v in default_state.items():
                     if k not in loaded_state: loaded_state[k] = v
                 return loaded_state
-        except: pass
+        except Exception as e: 
+            notify_error("Load Data Error", e)
     return default_state
 
 state = load_data()
@@ -84,21 +114,9 @@ def sync_save():
     try:
         with state_lock:
             with open(DB_FILE, 'w') as f: json.dump(state, f)
-    except Exception as e: print(f"Save Error: {e}")
-
-def execute_telegram_send(msg):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": str(TELEGRAM_CHAT_ID).strip(), "text": msg, "parse_mode": "HTML"}
-    for attempt in range(3):
-        try:
-            res = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=15)
-            if res.status_code == 200: return True
-            elif res.status_code == 429:
-                retry_after = res.json().get('parameters', {}).get('retry_after', 5)
-                time.sleep(retry_after)
-        except:
-            time.sleep(2)
-    return False
+    except Exception as e: 
+        print(f"Save Error: {e}")
+        notify_error("Sync Save Error", e)
 
 def is_ict_trading_window():
     try:
@@ -109,27 +127,30 @@ def is_ict_trading_window():
             start_time = (state.get('start_hour', 12) * 60) + state.get('start_minute', 30)
             end_time = (state.get('end_hour', 23) * 60) + state.get('end_minute', 59)
         return start_time <= total_minutes <= end_time
-    except: return True
+    except Exception as e: 
+        notify_error("ICT Trading Window Error", e)
+        return True
 
 # --- ⏰ REMINDER THREAD WORKER ---
 def signal_reminder_thread(signal_num, symbol, side, price):
-    """විනාඩියෙන් විනාඩියට මතක් කිරීමේ පණිවිඩය යවන Thread එක"""
-    time.sleep(60) # පළමු මතක් කිරීම විනාඩියකට පසුව
-    
-    while True:
-        with state_lock:
-            is_enabled = state.get('reminder_enabled', True)
-            is_active = state.get('active_reminders', {}).get(str(signal_num), False)
-            
-        if not is_enabled or not is_active:
-            break  # Reminder Off කර ඇත්නම් හෝ /ok ලබා දී ඇත්නම් Loop එක නතර වේ.
+    try:
+        time.sleep(60)
+        while True:
+            with state_lock:
+                is_enabled = state.get('reminder_enabled', True)
+                is_active = state.get('active_reminders', {}).get(str(signal_num), False)
+                
+            if not is_enabled or not is_active:
+                break
 
-        msg = (f"⏰ <b>SIGNAL REMINDER (#{signal_num:02d})</b> 🔔\n\n"
-               f"📍 Coin: <code>{symbol}</code> | Direction: <b>{side}</b>\n"
-               f"💵 Price: <code>{price}</code>\n\n"
-               f"👉 මෙම Alert එක නවතාලීමට <code>/ok</code> ලෙස Type කරන්න.")
-        execute_telegram_send(msg)
-        time.sleep(60) # විනාඩියක් ඉන්නවා
+            msg = (f"⏰ <b>SIGNAL REMINDER (#{signal_num:02d})</b> 🔔\n\n"
+                   f"📍 Coin: <code>{symbol}</code> | Direction: <b>{side}</b>\n"
+                   f"💵 Price: <code>{price}</code>\n\n"
+                   f"👉 මෙම Alert එක නවතාලීමට <code>/ok</code> ලෙස Type කරන්න.")
+            execute_telegram_send(msg)
+            time.sleep(60)
+    except Exception as e:
+        notify_error(f"Signal Reminder Thread Error ({symbol})", e)
 
 # --- 📊 PIVOT HIGH / LOW INDICATOR ---
 def calculate_pivots(df, left=14, right=14):
@@ -196,7 +217,9 @@ def run_symbol_scanner_process():
                 else:
                     with state_lock:
                         if s not in state['block_list']: state['block_list'].append(s)
-            except: pass
+            except Exception as inner_e: 
+                print(f"Skipping coin {s} due to error: {inner_e}")
+                pass
                 
         with state_lock:
             state['first_win_list'] = new_fwl
@@ -206,6 +229,7 @@ def run_symbol_scanner_process():
         execute_telegram_send(f"✅ <b>Scanner Complete!</b>\n\n/fwl {fwl_str}")
     except Exception as e:
         execute_telegram_send(f"❌ Scanner Error: {str(e)}")
+        notify_error("Symbol Scanner Process Error", e)
 
 # --- 📈 DATA ANALYSIS & INDICATOR LOGIC ---
 def analyze_and_check_signal(s):
@@ -237,7 +261,8 @@ def analyze_and_check_signal(s):
             if prev_price >= p_high and curr_price < p_high:
                 return "SELL", curr_price
         return "NONE", curr_price
-    except: return "NONE", 0.0
+    except Exception as e: 
+        return "NONE", 0.0
 
 # --- 🔄 MARKET SCANNING LOOP ---
 def scan_markets():
@@ -253,7 +278,6 @@ def scan_markets():
 
             print(f"⏰ [{datetime.datetime.now().strftime('%H:%M:%S')}] Market Scanning Active... (Positions: {len(active_positions)}/{max_signals})")
 
-            # ------ 🔄 PENDING RECOVERY RESUME CHECK ------
             if not bot_paused and is_ict_trading_window():
                 with state_lock:
                     recovery_steps_dict = dict(state.get('symbol_recovery_step', {}))
@@ -272,7 +296,7 @@ def scan_markets():
                                 print(f"🔄 Resuming recovery for {s} at Step {step}")
                                 execute_new_trade(s, "BUY", curr_p)
                                 time.sleep(2)
-                            except:
+                            except Exception as rec_e:
                                 pass
             
             if not bot_paused and is_ict_trading_window() and not recovery_only:
@@ -293,67 +317,71 @@ def scan_markets():
             time.sleep(5)
         except Exception as e: 
             print(f"❌ Scanner Error Loop: {e}")
+            notify_error("Market Scanner Loop Error", e)
             time.sleep(15)
             
 # --- 🚀 ENTRY & EXECUTE TRADE ---
 def execute_new_trade(s, side, current_p):
-    with state_lock:
-        state['signal_count'] += 1  
-        signal_num = state['signal_count']
-        
-        step = state['symbol_recovery_step'].get(s, 0)
-        accumulated_loss = state['symbol_accumulated_loss'].get(s, 0.0)
-        current_margin = state.get('base_margin', 0.80)
-        sl_margin_pct = state.get('margin_sl_pct', 27.0)
-        leverage = state.get('leverage', 10)
-        bh_balance_set = state.get('blacklist_balance_set', 0.10)
-        
-    if step == 0 and state.get('total_loss_cost', 0.0) >= 0.15:
-        accumulated_loss += 0.15
-        state['total_loss_cost'] -= 0.15
-
-    position_size = current_margin * leverage 
-    coin_sl_move_pct = (sl_margin_pct / leverage) / 100.0 
-    
-    if side == "BUY":
-        initial_sl = current_p * (1.0 - coin_sl_move_pct)
-        if step == 0:
-            required_move_pct = (current_margin * (state.get('fast_tp_pct', 30.0) / 100.0) + bh_balance_set) / position_size
-            initial_tp = current_p * (1.0 + required_move_pct)
-        else:
-            required_move_pct = (accumulated_loss + bh_balance_set + (position_size * 0.0008)) / position_size
-            initial_tp = current_p * (1.0 + required_move_pct)
-    else:
-        initial_sl = current_p * (1.0 + coin_sl_move_pct)
-        if step == 0:
-            required_move_pct = (current_margin * (state.get('fast_tp_pct', 30.0) / 100.0) + bh_balance_set) / position_size
-            initial_tp = current_p * (1.0 - required_move_pct)
-        else:
-            required_move_pct = (accumulated_loss + bh_balance_set + (position_size * 0.0008)) / position_size
-            initial_tp = current_p * (1.0 - required_move_pct)
+    try:
+        with state_lock:
+            state['signal_count'] += 1  
+            signal_num = state['signal_count']
             
-    with state_lock:
-        state['active_positions'][s] = {
-            "symbol": s, "side": side, "entry_price": current_p, "margin": current_margin,
-            "step": step, "tp": initial_tp, "sl": initial_sl, "timestamp": time.time(),
-            "signal_num": signal_num
-        }
-        if 'active_reminders' not in state: state['active_reminders'] = {}
-        state['active_reminders'][str(signal_num)] = True
-        
-    msg = (f"🔔 <b>NEW TRADING SIGNAL #{signal_num:02d}</b> 🚨\n\n"
-           f"📍 Coin: <code>{s}</code> | Direction: <b>{side}</b>\n"
-           f"💵 Margin: <b>${current_margin}</b> | Leverage: <b>{leverage}x</b>\n"
-           f"🎯 Target TP: <code>{round(initial_tp, 5)}</code>\n"
-           f"🛑 Target SL: <code>{round(initial_sl, 5)}</code>\n"
-           f"🔄 Step: <b>{step}/3</b>\n"
-           f"📊 Accum. Loss: <b>${round(accumulated_loss, 2)}</b>\n\n"
-           f"💡 <i>Alerts නතර කිරීමට <b>/ok</b> ලෙස Type කරන්න.</i>")
-    execute_telegram_send(msg)
-    sync_save()
+            step = state['symbol_recovery_step'].get(s, 0)
+            accumulated_loss = state['symbol_accumulated_loss'].get(s, 0.0)
+            current_margin = state.get('base_margin', 0.80)
+            sl_margin_pct = state.get('margin_sl_pct', 27.0)
+            leverage = state.get('leverage', 10)
+            bh_balance_set = state.get('blacklist_balance_set', 0.10)
+            
+        if step == 0 and state.get('total_loss_cost', 0.0) >= 0.15:
+            accumulated_loss += 0.15
+            state['total_loss_cost'] -= 0.15
 
-    if state.get('reminder_enabled', True):
-        threading.Thread(target=signal_reminder_thread, args=(signal_num, s, side, current_p), daemon=True).start()
+        position_size = current_margin * leverage 
+        coin_sl_move_pct = (sl_margin_pct / leverage) / 100.0 
+        
+        if side == "BUY":
+            initial_sl = current_p * (1.0 - coin_sl_move_pct)
+            if step == 0:
+                required_move_pct = (current_margin * (state.get('fast_tp_pct', 30.0) / 100.0) + bh_balance_set) / position_size
+                initial_tp = current_p * (1.0 + required_move_pct)
+            else:
+                required_move_pct = (accumulated_loss + bh_balance_set + (position_size * 0.0008)) / position_size
+                initial_tp = current_p * (1.0 + required_move_pct)
+        else:
+            initial_sl = current_p * (1.0 + coin_sl_move_pct)
+            if step == 0:
+                required_move_pct = (current_margin * (state.get('fast_tp_pct', 30.0) / 100.0) + bh_balance_set) / position_size
+                initial_tp = current_p * (1.0 - required_move_pct)
+            else:
+                required_move_pct = (accumulated_loss + bh_balance_set + (position_size * 0.0008)) / position_size
+                initial_tp = current_p * (1.0 - required_move_pct)
+                
+        with state_lock:
+            state['active_positions'][s] = {
+                "symbol": s, "side": side, "entry_price": current_p, "margin": current_margin,
+                "step": step, "tp": initial_tp, "sl": initial_sl, "timestamp": time.time(),
+                "signal_num": signal_num
+            }
+            if 'active_reminders' not in state: state['active_reminders'] = {}
+            state['active_reminders'][str(signal_num)] = True
+            
+        msg = (f"🔔 <b>NEW TRADING SIGNAL #{signal_num:02d}</b> 🚨\n\n"
+               f"📍 Coin: <code>{s}</code> | Direction: <b>{side}</b>\n"
+               f"💵 Margin: <b>${current_margin}</b> | Leverage: <b>{leverage}x</b>\n"
+               f"🎯 Target TP: <code>{round(initial_tp, 5)}</code>\n"
+               f"🛑 Target SL: <code>{round(initial_sl, 5)}</code>\n"
+               f"🔄 Step: <b>{step}/3</b>\n"
+               f"📊 Accum. Loss: <b>${round(accumulated_loss, 2)}</b>\n\n"
+               f"💡 <i>Alerts නතර කිරීමට <b>/ok</b> ලෙස Type කරන්න.</i>")
+        execute_telegram_send(msg)
+        sync_save()
+
+        if state.get('reminder_enabled', True):
+            threading.Thread(target=signal_reminder_thread, args=(signal_num, s, side, current_p), daemon=True).start()
+    except Exception as e:
+        notify_error(f"Execute New Trade Error ({s})", e)
 
 # --- 🔄 LIVE MONITOR & AUTO-REVERSE ---
 def live_monitor_loop():
@@ -362,9 +390,6 @@ def live_monitor_loop():
             with state_lock: 
                 active_keys = list(state['active_positions'].keys())
             
-            if active_keys:
-                print(f"📊 Monitoring Active Coins: {active_keys}")
-
             for s in active_keys:
                 with state_lock: 
                     pos = state['active_positions'].get(s)
@@ -385,7 +410,6 @@ def live_monitor_loop():
                     is_tp = (side == "BUY" and current_p >= tp_price) or (side == "SELL" and current_p <= tp_price)
                     is_sl = (side == "BUY" and current_p <= sl_price) or (side == "SELL" and current_p >= sl_price)
                     
-                    # 🎯 TAKE PROFIT (WIN)
                     if is_tp:
                         print(f"🎯 TP HIT for {s}! Price: {current_p}")
                         profit_amount = margin * (state.get('fast_tp_pct', 30.0) / 100.0)
@@ -415,7 +439,6 @@ def live_monitor_loop():
                                   f"🔄 Step: <b>{step}</b> (Reset to 0)")
                         execute_telegram_send(tp_msg)
 
-                    # 🛑 STOP LOSS (LOSS)
                     elif is_sl:
                         print(f"🛑 SL HIT for {s}! Price: {current_p}")
                         loss_amount = margin * (state.get('margin_sl_pct', 27.0) / 100.0)
@@ -463,13 +486,14 @@ def live_monitor_loop():
                         
                         sync_save()
 
-                except Exception as e:
-                    print(f"Error checking price for {s}: {e}")
+                except Exception as inner_e:
+                    print(f"Error checking price for {s}: {inner_e}")
                     
             time.sleep(3) 
             
         except Exception as global_e:
             print(f"Global Error in live monitor: {global_e}")
+            notify_error("Live Monitor Loop Error", global_e)
             time.sleep(10)
 
 # --- 📅 DAILY PERFORMANCE REPORT ---
@@ -493,7 +517,9 @@ def cron_daily_report_worker():
                 sync_save()
                 time.sleep(60)
             time.sleep(30)
-        except: time.sleep(10)
+        except Exception as e: 
+            notify_error("Cron Daily Report Worker Error", e)
+            time.sleep(10)
 
 # --- 💬 TELEGRAM WEBHOOK MANAGER ---
 @app.route('/webhook', methods=['POST'])
@@ -541,7 +567,7 @@ def telegram_webhook():
                         state['max_signals'] = new_limit
                     sync_save()
                     execute_telegram_send(f"⚙️ Active Trade Limit එක {new_limit} ලෙස සාර්ථකව වෙනස් කරන ලදී.")
-                except:
+                except Exception as e:
                     execute_telegram_send("❌ දෝෂයකි! කරුණාකර නිවැරදි අංකයක් ලබා දෙන්න. (උදා: /set_max_signals 15)")
             
             elif cmd == "status":
@@ -562,10 +588,7 @@ def telegram_webhook():
                     end_t = f"{state.get('end_hour', 23):02d}:{state.get('end_minute', 59):02d}"
                     
                     fwl_list = state.get('first_win_list', [])
-                    fwl_str = " ".join(fwl_list) if fwl_list else "None"
-                    
                     fw_coins = state.get('first_win_coins', [])
-                    fw_coins_str = " ".join(fw_coins) if fw_coins else "None"
                     rem_status = "සක්‍රීයයි 🟢" if state.get('reminder_enabled', True) else "අක්‍රීයයි 🔴"
                     
                     msg = (f"ℹ️ <b>[RED BULL MASTER STATUS REPORT]</b>\n"
@@ -584,7 +607,7 @@ def telegram_webhook():
                            f"🏆 First Win Coins ගණන: <b>{len(fw_coins)}</b>\n"
                            f"🚫 Blacklist Coins ගණන: <b>{len(state.get('block_list', []))}</b>\n\n"
                            f"💰 <b>Total Loss Cost:</b> <b>${round(state.get('total_loss_cost', 0.0), 2)}</b>\n"
-                           f"🏆 First Win Coin: <code>{fw_coins_str}</code>")
+                           f"🏆 First Win Coin: <code>{' '.join(fw_coins) if fw_coins else 'None'}</code>")
                 execute_telegram_send(msg)
 
             elif cmd == "menu":
@@ -704,7 +727,7 @@ def telegram_webhook():
                         state['start_hour'], state['start_minute'] = int(start[0]), int(start[1])
                         state['end_hour'], state['end_minute'] = int(end[0]), int(end[1])
                     sync_save(); execute_telegram_send(f"⏰ සිග්නල් සෙවීමේ කාලය {tokens[1]} සිට {tokens[2]} දක්වා සකස් කලා.")
-                except: pass
+                except Exception as e: pass
 
             elif cmd == "set_fw_time" and len(tokens) > 2:
                 try:
@@ -714,7 +737,7 @@ def telegram_webhook():
                         state['fw_start_hour'], state['fw_start_minute'] = int(start[0]), int(start[1])
                         state['fw_end_hour'], state['fw_end_minute'] = int(end[0]), int(end[1])
                     sync_save(); execute_telegram_send(f"⏰ First Win Scanner කාලය {tokens[1]} සිට {tokens[2]} දක්වා සකස් කලා.")
-                except: pass
+                except Exception as e: pass
 
             elif cmd == "reset_trades":
                 with state_lock: state['active_positions'] = {}
@@ -751,6 +774,7 @@ def telegram_webhook():
 
     except Exception as e:
         print(f"Webhook Error: {e}")
+        notify_error("Telegram Webhook Error", e)
     return "OK", 200
 
 @app.route('/', methods=['GET'])
