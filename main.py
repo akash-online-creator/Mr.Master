@@ -760,4 +760,4 @@ if __name__ == '__main__':
     threading.Thread(target=scan_markets, daemon=True).start()
     threading.Thread(target=live_monitor_loop, daemon=True).start()
     threading.Thread(target=cron_daily_report_worker, daemon=True).start()
-    app.run(port=PORT, host='0.0.0.0', debug=False, use_reloader=False)​
+    app.run(port=PORT, host='0.0.0.0', debug=False, use_reloader=False)
