@@ -291,18 +291,32 @@ def scan_markets():
                         
                         if not is_already_active and not is_blacklisted and current_active_count < max_signals:
                             try:
-                                k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=1", timeout=10)
-                                curr_p = float(k_res.json()[-1][4])
-                                print(f"🔄 Resuming recovery for {s} at Step {step}")
-                                execute_new_trade(s, "BUY", curr_p)
-                                time.sleep(2)
+                                k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=1", timeout=15)
+                                if k_res.status_code == 200:
+                                    k_data = k_res.json()
+                                    if isinstance(k_data, list) and len(k_data) > 0:
+                                        curr_p = float(k_data[-1][4])
+                                        print(f"🔄 Resuming recovery for {s} at Step {step}")
+                                        execute_new_trade(s, "BUY", curr_p)
+                                        time.sleep(2)
                             except Exception as rec_e:
                                 pass
             
             if not bot_paused and is_ict_trading_window() and not recovery_only:
-                res = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
-                symbols = [t['symbol'] for t in res.json() if t['symbol'].endswith("USDT")]
-                
+                # Connection Error මඟහරවා ගැනීමට try-except එකක් යොදමු
+                symbols = []
+                try:
+                    res = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
+                    if res.status_code == 200:
+                        data = res.json()
+                        # data යනු list එකක් දැයි පරීක්ෂා කිරීම (TypeError වැළැක්වීමට)
+                        if isinstance(data, list):
+                            symbols = [t['symbol'] for t in data if isinstance(t, dict) and t.get('symbol', '').endswith("USDT")]
+                except requests.exceptions.RequestException as net_e:
+                    print(f"⚠️ Network Connection Error in Ticker: {net_e}")
+                    time.sleep(10)
+                    continue
+
                 for s in symbols:
                     if s in state.get('block_list', []): continue
                     if s in active_positions: continue
