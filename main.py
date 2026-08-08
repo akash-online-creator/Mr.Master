@@ -55,7 +55,7 @@ def notify_error(context_msg, error_obj):
     except Exception as e:
         print(f"Failed to send error notification: {e}")
 
-# --- 2. STATE MANAGEMENT & DATABASE ---
+# --- 2. STATE MANAGEMENT & DATABASE (Fixed Thread Safety) ---
 def load_data():
     default_state = {
         'active_positions': {},        
@@ -82,6 +82,7 @@ def load_data():
         'margin_sl_pct': 27.0,          
         'fast_tp_pct': 30.0,            
         'leverage': 10,                 
+        'blacklist_balance_set': 0.10,
         
         'start_hour': 12,
         'start_minute': 30,
@@ -111,9 +112,11 @@ state = load_data()
 state_lock = threading.Lock()
 
 def sync_save():
+    """ගොනුවට එකවර ලිවීමේදී සිදුවන දෝෂ (Race Conditions) වැළැක්වීමට Lock එක භාවිත කර ඇත"""
     try:
         with state_lock:
-            with open(DB_FILE, 'w') as f: json.dump(state, f)
+            with open(DB_FILE, 'w') as f: 
+                json.dump(state, f, indent=4)
     except Exception as e: 
         print(f"Save Error: {e}")
         notify_error("Sync Save Error", e)
@@ -264,7 +267,7 @@ def analyze_and_check_signal(s):
     except Exception as e: 
         return "NONE", 0.0
 
-# --- 🔄 MARKET SCANNING LOOP ---
+# --- 🔄 MARKET SCANNING LOOP (Fixed Recovery Logic) ---
 def scan_markets():
     while True:
         try:
@@ -278,6 +281,7 @@ def scan_markets():
 
             print(f"⏰ [{datetime.datetime.now().strftime('%H:%M:%S')}] Market Scanning Active... (Positions: {len(active_positions)}/{max_signals})")
 
+            # 1. Recovery Process Loop (Fixed to check correct signal instead of hardcoded "BUY")
             if not bot_paused and is_ict_trading_window():
                 with state_lock:
                     recovery_steps_dict = dict(state.get('symbol_recovery_step', {}))
@@ -291,25 +295,21 @@ def scan_markets():
                         
                         if not is_already_active and not is_blacklisted and current_active_count < max_signals:
                             try:
-                                k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=1", timeout=15)
-                                if k_res.status_code == 200:
-                                    k_data = k_res.json()
-                                    if isinstance(k_data, list) and len(k_data) > 0:
-                                        curr_p = float(k_data[-1][4])
-                                        print(f"🔄 Resuming recovery for {s} at Step {step}")
-                                        execute_new_trade(s, "BUY", curr_p)
-                                        time.sleep(2)
+                                signal, curr_p = analyze_and_check_signal(s)
+                                if signal != "NONE":
+                                    print(f"🔄 Resuming recovery for {s} at Step {step} with direction {signal}")
+                                    execute_new_trade(s, signal, curr_p)
+                                    time.sleep(2)
                             except Exception as rec_e:
                                 pass
             
+            # 2. Normal/Direct Market Scanning Loop
             if not bot_paused and is_ict_trading_window() and not recovery_only:
-                # Connection Error මඟහරවා ගැනීමට try-except එකක් යොදමු
                 symbols = []
                 try:
                     res = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
                     if res.status_code == 200:
                         data = res.json()
-                        # data යනු list එකක් දැයි පරීක්ෂා කිරීම (TypeError වැළැක්වීමට)
                         if isinstance(data, list):
                             symbols = [t['symbol'] for t in data if isinstance(t, dict) and t.get('symbol', '').endswith("USDT")]
                 except requests.exceptions.RequestException as net_e:
@@ -334,7 +334,7 @@ def scan_markets():
             notify_error("Market Scanner Loop Error", e)
             time.sleep(15)
             
-# --- 🚀 ENTRY & EXECUTE TRADE ---
+# --- 🚀 ENTRY & EXECUTE TRADE (Fixed NameError & Calculations) ---
 def execute_new_trade(s, side, current_p):
     try:
         with state_lock:
@@ -346,6 +346,7 @@ def execute_new_trade(s, side, current_p):
             current_margin = state.get('base_margin', 0.80)
             sl_margin_pct = state.get('margin_sl_pct', 27.0)
             leverage = state.get('leverage', 10)
+            # Safe retrieval for blacklist balance set (Fixes NameError)
             bh_balance_set = state.get('blacklist_balance_set', 0.10)
             
         if step == 0 and state.get('total_loss_cost', 0.0) >= 0.15:
@@ -355,22 +356,20 @@ def execute_new_trade(s, side, current_p):
         position_size = current_margin * leverage 
         coin_sl_move_pct = (sl_margin_pct / leverage) / 100.0 
         
+        if step == 0:
+            target_profit_dollar = (current_margin * (state.get('fast_tp_pct', 30.0) / 100.0)) + bh_balance_set
+        else:
+            est_fee = position_size * 0.0016 
+            target_profit_dollar = accumulated_loss + bh_balance_set + est_fee
+
+        required_move_pct = target_profit_dollar / position_size
+
         if side == "BUY":
             initial_sl = current_p * (1.0 - coin_sl_move_pct)
-            if step == 0:
-                required_move_pct = (current_margin * (state.get('fast_tp_pct', 30.0) / 100.0) + bh_balance_set) / position_size
-                initial_tp = current_p * (1.0 + required_move_pct)
-            else:
-                required_move_pct = (accumulated_loss + bh_balance_set + (position_size * 0.0008)) / position_size
-                initial_tp = current_p * (1.0 + required_move_pct)
+            initial_tp = current_p * (1.0 + required_move_pct)
         else:
             initial_sl = current_p * (1.0 + coin_sl_move_pct)
-            if step == 0:
-                required_move_pct = (current_margin * (state.get('fast_tp_pct', 30.0) / 100.0) + bh_balance_set) / position_size
-                initial_tp = current_p * (1.0 - required_move_pct)
-            else:
-                required_move_pct = (accumulated_loss + bh_balance_set + (position_size * 0.0008)) / position_size
-                initial_tp = current_p * (1.0 - required_move_pct)
+            initial_tp = current_p * (1.0 - required_move_pct)
                 
         with state_lock:
             state['active_positions'][s] = {
@@ -470,7 +469,7 @@ def live_monitor_loop():
                                 state['active_reminders'][str(signal_num)] = False
                                 
                             if new_step > 3:
-                                est_fee = margin * 0.0008 * leverage 
+                                est_fee = (margin * leverage) * 0.0016 
                                 total_blacklist_loss = loss_amount + est_fee
                     
                                 state['shared_loss_buffer'] += total_blacklist_loss
