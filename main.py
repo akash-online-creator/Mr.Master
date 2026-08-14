@@ -163,7 +163,7 @@ def calculate_pivots(df, left=14, right=14):
     df['pivot_low'] = df['pivot_low'].ffill()
     return df
 
-# --- 📈 DATA ANALYSIS & INDICATOR LOGIC ---
+# --- 📈 DATA ANALYSIS & INDICATOR LOGIC (REVERSED: BUY <-> SELL) ---
 def analyze_and_check_signal(s):
     try:
         k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=600", timeout=10)
@@ -188,10 +188,10 @@ def analyze_and_check_signal(s):
         
         if ema50 > ema100 > ema200:
             if prev_price <= p_low and curr_price > p_low:
-                return "BUY", curr_price
+                return "SELL", curr_price  # මූලිකව BUY ආ තැන දැන් SELL ලෙස ප්‍රතිදානය වේ
         elif ema50 < ema100 < ema200:
             if prev_price >= p_high and curr_price < p_high:
-                return "SELL", curr_price
+                return "BUY", curr_price   # මූලිකව SELL ආ තැන දැන් BUY ලෙස ප්‍රතිදානය වේ
         return "NONE", curr_price
     except Exception as e: 
         return "NONE", 0.0
@@ -224,7 +224,7 @@ def scan_markets():
             notify_error("Market Scanner Loop Error", e)
             time.sleep(15)
             
-# --- 🚀 ENTRY & EXECUTE TRADE (Modified for Win-Step Logic & Previous Loss TP Inclusion) ---
+# --- 🚀 ENTRY & EXECUTE TRADE ---
 def execute_new_trade(s, side, current_p):
     try:
         with state_lock:
@@ -237,12 +237,10 @@ def execute_new_trade(s, side, current_p):
             leverage = state.get('leverage', 10)
             bh_balance_set = state.get('blacklist_balance_set', 0.10)
             
-            # එකතු වී ඇති loss එකක් ඇත්නම් එයින් එකක් ඉවත් කර ඊළඟ trade එකට යෙදීම
             pending_loss_to_add = 0.0
             if s in state.get('symbol_loss_details', {}):
                 loss_info = state['symbol_loss_details'][s]
                 if loss_info['count'] > 0 and loss_info['amounts']:
-                    # එක loss එකක් පමණක් ඉවත් කර TP සඳහා යොදයි
                     pending_loss_to_add = loss_info['amounts'].pop(0)
                     loss_info['count'] = len(loss_info['amounts'])
                     if loss_info['count'] == 0:
@@ -251,12 +249,11 @@ def execute_new_trade(s, side, current_p):
         position_size = current_margin * leverage 
         coin_sl_move_pct = (sl_margin_pct / leverage) / 100.0 
         
-        est_fee = position_size * 0.0016  # Binance fee එක ගණනය කිරීම
+        est_fee = position_size * 0.0016  
         
         if step == 0 and pending_loss_to_add == 0.0:
             target_profit_dollar = (current_margin * (state.get('fast_tp_pct', 30.0) / 100.0)) + bh_balance_set
         else:
-            # Win වන විට පෙර loss එකේ අගය + binance fee එක TP එකට ඇතුළත් කිරීම
             base_target = current_margin * (state.get('fast_tp_pct', 30.0) / 100.0)
             target_profit_dollar = base_target + pending_loss_to_add + est_fee + bh_balance_set
 
@@ -327,7 +324,6 @@ def live_monitor_loop():
                             if s in state['active_positions']:
                                 del state['active_positions'][s]
                             
-                            # Win වූ විට Step එක ඉදිරියට (ඉහළට) යයි
                             new_step = step + 1
                             state['symbol_recovery_step'][s] = new_step
                             
@@ -355,16 +351,13 @@ def live_monitor_loop():
                             if s in state['active_positions']:
                                 del state['active_positions'][s]
                             
-                            # Loss වූ විට step යෑම නවතා step එක 0 ට රීසෙට් කරයි
                             state['symbol_recovery_step'][s] = 0
                             
-                            # Loss එක එකතු කර /loss_balance සඳහා ගබඩා කිරීම
                             if s not in state['symbol_loss_details']:
                                 state['symbol_loss_details'][s] = {'count': 0, 'amounts': []}
                             state['symbol_loss_details'][s]['count'] += 1
                             state['symbol_loss_details'][s]['amounts'].append(loss_amount)
                             
-                            # කාසිය දිගින් දිගටම 3 වරක් loss වී ඇත්නම් Blacklist කිරීම
                             loss_count_total = state['symbol_loss_details'][s]['count']
                             if loss_count_total >= 3:
                                 if s not in state['block_list']:
