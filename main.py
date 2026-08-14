@@ -42,7 +42,6 @@ def execute_telegram_send(msg):
     return False
 
 def notify_error(context_msg, error_obj):
-    """දෝෂයක් සිදු වූ විට Telegram වෙත ක්ෂණිකව දන්වයි"""
     try:
         tb_str = traceback.format_exc()
         error_msg = (
@@ -55,27 +54,23 @@ def notify_error(context_msg, error_obj):
     except Exception as e:
         print(f"Failed to send error notification: {e}")
 
-# --- 2. STATE MANAGEMENT & DATABASE (Fixed Thread Safety) ---
+# --- 2. STATE MANAGEMENT & DATABASE ---
 def load_data():
     default_state = {
         'active_positions': {},        
-        'symbol_recovery_step': {},     
-        'symbol_accumulated_loss': {},  
+        'symbol_recovery_step': {},     # Win වූ විට step වැඩි වීමට මෙහි ගබඩා වේ
+        'symbol_loss_details': {},      # විස්තර සඳහා: {symbol: {'count': count, 'amount': total_amount}}
         'block_list': [],  
         'signal_count': 0, 
-        'is_paused': False,
+        'is_paused': True,              # /botrun මඟින් සක්‍රීය වන තෙක් Paused වී ඇත
         'is_scanning': True,
         'max_signals': 10,
         'stats': {'wins': 0, 'loss': 0, 'total_pnl': 0.0, 'blacklist_coins': []},
         'daily_stats': {'wins': 0, 'loss': 0, 'win_amount': 0.0, 'loss_amount': 0.0, 'blacklist_coins': [], 'last_reset_date': str(datetime.date.today())},
         
-        'direct_mode': False,
-        'recovery_only_mode': False,     
-        
         'first_win_list': [],         
         'first_win_coins': [], 
         'shared_loss_buffer': 0.0,       
-        'shared_loss_splits': 0,         
         'total_loss_cost': 0.0,
 
         'base_margin': 0.80,            
@@ -84,15 +79,10 @@ def load_data():
         'leverage': 10,                 
         'blacklist_balance_set': 0.10,
         
-        'start_hour': 12,
-        'start_minute': 30,
+        'start_hour': 0,
+        'start_minute': 0,
         'end_hour': 23,
         'end_minute': 59,
-        
-        'fw_start_hour': 0,
-        'fw_start_minute': 0,
-        'fw_end_hour': 8,
-        'fw_end_minute': 0,
 
         'reminder_enabled': True,
         'active_reminders': {}
@@ -112,7 +102,6 @@ state = load_data()
 state_lock = threading.Lock()
 
 def sync_save():
-    """ගොනුවට එකවර ලිවීමේදී සිදුවන දෝෂ (Race Conditions) වැළැක්වීමට Lock එක භාවිත කර ඇත"""
     try:
         with state_lock:
             with open(DB_FILE, 'w') as f: 
@@ -127,7 +116,7 @@ def is_ict_trading_window():
         tz_now = datetime.datetime.now(tz)
         total_minutes = (tz_now.hour * 60) + tz_now.minute
         with state_lock:
-            start_time = (state.get('start_hour', 12) * 60) + state.get('start_minute', 30)
+            start_time = (state.get('start_hour', 0) * 60) + state.get('start_minute', 0)
             end_time = (state.get('end_hour', 23) * 60) + state.get('end_minute', 59)
         return start_time <= total_minutes <= end_time
     except Exception as e: 
@@ -174,66 +163,6 @@ def calculate_pivots(df, left=14, right=14):
     df['pivot_low'] = df['pivot_low'].ffill()
     return df
 
-# --- 🔍 STEP 1: SYMBOL SCANNER (FWL GENERATION) ---
-def run_symbol_scanner_process():
-    execute_telegram_send("🔍 <b>Binance Futures Scanner එක ආරම්භ කළා...</b>\nපැය 24 පරිමාව $40M වැඩි කාසි පරීක්ෂා කරමින් පවතී.")
-    try:
-        res = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
-        all_coins = res.json()
-        
-        filtered_by_vol = []
-        for ticker in all_coins:
-            symbol = ticker['symbol']
-            volume = float(ticker.get('quoteVolume', 0))
-            if symbol.endswith("USDT") and volume >= 40000000:
-                filtered_by_vol.append(symbol)
-                
-        new_fwl = []
-        for s in filtered_by_vol:
-            with state_lock:
-                if s in state.get('block_list', []): continue
-            
-            try:
-                time.sleep(0.5) 
-                k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=5000", timeout=15)
-                df = pd.DataFrame(k_res.json(), columns=['t','open','high','low','close','v','ct','qv','nt','tb','tq','i'])
-                
-                closes = df['close'].astype(float)
-                df['ema50'] = closes.ewm(span=50, adjust=False).mean()
-                df['ema100'] = closes.ewm(span=100, adjust=False).mean()
-                df['ema200'] = closes.ewm(span=200, adjust=False).mean()
-                df = calculate_pivots(df, 14, 14)
-                
-                losses = 0
-                for i in range(200, len(df)-1):
-                    row = df.iloc[i]
-                    next_row = df.iloc[i+1]
-                    if row['ema50'] > row['ema100'] > row['ema200']:
-                        if float(next_row['close']) < row['pivot_low'] * 0.997:
-                            losses += 1
-                    elif row['ema50'] < row['ema100'] < row['ema200']:
-                        if float(next_row['close']) > row['pivot_high'] * 1.003:
-                            losses += 1
-                            
-                if losses < 3:
-                    new_fwl.append(s)
-                else:
-                    with state_lock:
-                        if s not in state['block_list']: state['block_list'].append(s)
-            except Exception as inner_e: 
-                print(f"Skipping coin {s} due to error: {inner_e}")
-                pass
-                
-        with state_lock:
-            state['first_win_list'] = new_fwl
-        sync_save()
-        
-        fwl_str = " ".join(new_fwl)
-        execute_telegram_send(f"✅ <b>Scanner Complete!</b>\n\n/fwl {fwl_str}")
-    except Exception as e:
-        execute_telegram_send(f"❌ Scanner Error: {str(e)}")
-        notify_error("Symbol Scanner Process Error", e)
-
 # --- 📈 DATA ANALYSIS & INDICATOR LOGIC ---
 def analyze_and_check_signal(s):
     try:
@@ -267,61 +196,22 @@ def analyze_and_check_signal(s):
     except Exception as e: 
         return "NONE", 0.0
 
-# --- 🔄 MARKET SCANNING LOOP (Fixed Recovery Logic) ---
+# --- 🔄 MANUAL FWL MARKET SCANNING LOOP ---
 def scan_markets():
     while True:
         try:
             with state_lock:
                 bot_paused = state.get('is_paused', False)
-                direct_mode = state.get('direct_mode', False)
-                recovery_only = state.get('recovery_only_mode', False)
                 fwl = list(state.get('first_win_list', []))
                 active_positions = dict(state['active_positions'])
                 max_signals = state.get('max_signals', 10)
 
-            print(f"⏰ [{datetime.datetime.now().strftime('%H:%M:%S')}] Market Scanning Active... (Positions: {len(active_positions)}/{max_signals})")
-
-            # 1. Recovery Process Loop (Fixed to check correct signal instead of hardcoded "BUY")
             if not bot_paused and is_ict_trading_window():
-                with state_lock:
-                    recovery_steps_dict = dict(state.get('symbol_recovery_step', {}))
-                
-                for s, step in recovery_steps_dict.items():
-                    if step > 0:  
-                        with state_lock:
-                            is_already_active = s in state['active_positions']
-                            is_blacklisted = s in state.get('block_list', [])
-                            current_active_count = len(state['active_positions'])
-                        
-                        if not is_already_active and not is_blacklisted and current_active_count < max_signals:
-                            try:
-                                signal, curr_p = analyze_and_check_signal(s)
-                                if signal != "NONE":
-                                    print(f"🔄 Resuming recovery for {s} at Step {step} with direction {signal}")
-                                    execute_new_trade(s, signal, curr_p)
-                                    time.sleep(2)
-                            except Exception as rec_e:
-                                pass
-            
-            # 2. Normal/Direct Market Scanning Loop
-            if not bot_paused and is_ict_trading_window() and not recovery_only:
-                symbols = []
-                try:
-                    res = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
-                    if res.status_code == 200:
-                        data = res.json()
-                        if isinstance(data, list):
-                            symbols = [t['symbol'] for t in data if isinstance(t, dict) and t.get('symbol', '').endswith("USDT")]
-                except requests.exceptions.RequestException as net_e:
-                    print(f"⚠️ Network Connection Error in Ticker: {net_e}")
-                    time.sleep(10)
-                    continue
-
-                for s in symbols:
-                    if s in state.get('block_list', []): continue
-                    if s in active_positions: continue
-                    if not direct_mode and s not in fwl: continue
-                    if len(active_positions) >= max_signals: break
+                for s in fwl:
+                    with state_lock:
+                        if s in state.get('block_list', []): continue
+                        if s in active_positions: continue
+                        if len(state['active_positions']) >= max_signals: break
                     
                     signal, price = analyze_and_check_signal(s)
                     if signal != "NONE":
@@ -334,7 +224,7 @@ def scan_markets():
             notify_error("Market Scanner Loop Error", e)
             time.sleep(15)
             
-# --- 🚀 ENTRY & EXECUTE TRADE (Fixed NameError & Calculations) ---
+# --- 🚀 ENTRY & EXECUTE TRADE (Modified for Win-Step Logic & Previous Loss TP Inclusion) ---
 def execute_new_trade(s, side, current_p):
     try:
         with state_lock:
@@ -342,25 +232,33 @@ def execute_new_trade(s, side, current_p):
             signal_num = state['signal_count']
             
             step = state['symbol_recovery_step'].get(s, 0)
-            accumulated_loss = state['symbol_accumulated_loss'].get(s, 0.0)
             current_margin = state.get('base_margin', 0.80)
             sl_margin_pct = state.get('margin_sl_pct', 27.0)
             leverage = state.get('leverage', 10)
-            # Safe retrieval for blacklist balance set (Fixes NameError)
             bh_balance_set = state.get('blacklist_balance_set', 0.10)
             
-        if step == 0 and state.get('total_loss_cost', 0.0) >= 0.15:
-            accumulated_loss += 0.15
-            state['total_loss_cost'] -= 0.15
+            # එකතු වී ඇති loss එකක් ඇත්නම් එයින් එකක් ඉවත් කර ඊළඟ trade එකට යෙදීම
+            pending_loss_to_add = 0.0
+            if s in state.get('symbol_loss_details', {}):
+                loss_info = state['symbol_loss_details'][s]
+                if loss_info['count'] > 0 and loss_info['amounts']:
+                    # එක loss එකක් පමණක් ඉවත් කර TP සඳහා යොදයි
+                    pending_loss_to_add = loss_info['amounts'].pop(0)
+                    loss_info['count'] = len(loss_info['amounts'])
+                    if loss_info['count'] == 0:
+                        del state['symbol_loss_details'][s]
 
         position_size = current_margin * leverage 
         coin_sl_move_pct = (sl_margin_pct / leverage) / 100.0 
         
-        if step == 0:
+        est_fee = position_size * 0.0016  # Binance fee එක ගණනය කිරීම
+        
+        if step == 0 and pending_loss_to_add == 0.0:
             target_profit_dollar = (current_margin * (state.get('fast_tp_pct', 30.0) / 100.0)) + bh_balance_set
         else:
-            est_fee = position_size * 0.0016 
-            target_profit_dollar = accumulated_loss + bh_balance_set + est_fee
+            # Win වන විට පෙර loss එකේ අගය + binance fee එක TP එකට ඇතුළත් කිරීම
+            base_target = current_margin * (state.get('fast_tp_pct', 30.0) / 100.0)
+            target_profit_dollar = base_target + pending_loss_to_add + est_fee + bh_balance_set
 
         required_move_pct = target_profit_dollar / position_size
 
@@ -375,7 +273,7 @@ def execute_new_trade(s, side, current_p):
             state['active_positions'][s] = {
                 "symbol": s, "side": side, "entry_price": current_p, "margin": current_margin,
                 "step": step, "tp": initial_tp, "sl": initial_sl, "timestamp": time.time(),
-                "signal_num": signal_num
+                "signal_num": signal_num, "attached_loss": pending_loss_to_add
             }
             if 'active_reminders' not in state: state['active_reminders'] = {}
             state['active_reminders'][str(signal_num)] = True
@@ -385,8 +283,7 @@ def execute_new_trade(s, side, current_p):
                f"💵 Margin: <b>${current_margin}</b> | Leverage: <b>{leverage}x</b>\n"
                f"🎯 Target TP: <code>{round(initial_tp, 5)}</code>\n"
                f"🛑 Target SL: <code>{round(initial_sl, 5)}</code>\n"
-               f"🔄 Step: <b>{step}/3</b>\n"
-               f"📊 Accum. Loss: <b>${round(accumulated_loss, 2)}</b>\n\n"
+               f"📈 Step: <b>{step}</b> | Attached Loss: <b>${round(pending_loss_to_add, 2)}</b>\n\n"
                f"💡 <i>Alerts නතර කිරීමට <b>/ok</b> ලෙස Type කරන්න.</i>")
         execute_telegram_send(msg)
         sync_save()
@@ -396,7 +293,7 @@ def execute_new_trade(s, side, current_p):
     except Exception as e:
         notify_error(f"Execute New Trade Error ({s})", e)
 
-# --- 🔄 LIVE MONITOR & AUTO-REVERSE ---
+# --- 🔄 LIVE MONITOR & WIN-STEP RECOVERY LOGIC ---
 def live_monitor_loop():
     while True:
         try:
@@ -414,7 +311,6 @@ def live_monitor_loop():
                 step = pos.get('step', 0)
                 margin = pos.get('margin', 0.80)
                 signal_num = pos.get('signal_num', None)
-                leverage = state.get('leverage', 10)
                 
                 try:
                     k_res2 = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=1", timeout=10)
@@ -430,15 +326,14 @@ def live_monitor_loop():
                         with state_lock:
                             if s in state['active_positions']:
                                 del state['active_positions'][s]
-                            state['symbol_recovery_step'][s] = 0
-                            state['symbol_accumulated_loss'][s] = 0.0
+                            
+                            # Win වූ විට Step එක ඉදිරියට (ඉහළට) යයි
+                            new_step = step + 1
+                            state['symbol_recovery_step'][s] = new_step
                             
                             state['stats']['wins'] += 1
                             state['daily_stats']['wins'] += 1
                             state['daily_stats']['win_amount'] += profit_amount
-                            
-                            if step == 0 and s not in state.get('first_win_coins', []):
-                                state['first_win_coins'].append(s)
                             
                             if signal_num and str(signal_num) in state.get('active_reminders', {}):
                                 state['active_reminders'][str(signal_num)] = False
@@ -449,7 +344,7 @@ def live_monitor_loop():
                                   f"📍 Coin: <code>{s}</code>\n"
                                   f"💰 Profit: <b>+${round(profit_amount, 2)}</b>\n"
                                   f"🏁 Exit Price: <code>{current_p}</code>\n"
-                                  f"🔄 Step: <b>{step}</b> (Reset to 0)")
+                                  f"📈 New Step: <b>{new_step}</b>")
                         execute_telegram_send(tp_msg)
 
                     elif is_sl:
@@ -459,7 +354,30 @@ def live_monitor_loop():
                         with state_lock:
                             if s in state['active_positions']:
                                 del state['active_positions'][s]
-                            new_step = step + 1
+                            
+                            # Loss වූ විට step යෑම නවතා step එක 0 ට රීසෙට් කරයි
+                            state['symbol_recovery_step'][s] = 0
+                            
+                            # Loss එක එකතු කර /loss_balance සඳහා ගබඩා කිරීම
+                            if s not in state['symbol_loss_details']:
+                                state['symbol_loss_details'][s] = {'count': 0, 'amounts': []}
+                            state['symbol_loss_details'][s]['count'] += 1
+                            state['symbol_loss_details'][s]['amounts'].append(loss_amount)
+                            
+                            # කාසිය දිගින් දිගටම 3 වරක් loss වී ඇත්නම් Blacklist කිරීම
+                            loss_count_total = state['symbol_loss_details'][s]['count']
+                            if loss_count_total >= 3:
+                                if s not in state['block_list']:
+                                    state['block_list'].append(s)
+                                if s not in state['daily_stats']['blacklist_coins']:
+                                    state['daily_stats']['blacklist_coins'].append(s)
+                                if s in state.get('first_win_list', []):
+                                    state['first_win_list'].remove(s)
+                                
+                                bl_msg = (f"🚫 <b>MAX LOSS REACHED (BLACKLISTED)!</b> 🔴\n\n"
+                                          f"📍 Coin: <code>{s}</code>\n"
+                                          f"⚠️ මෙම කාසිය 3 වරක් Loss වී ඇති බැවින් ස්වයංක්‍රීයව Blacklist කරන ලදී.")
+                                execute_telegram_send(bl_msg)
                             
                             state['stats']['loss'] += 1
                             state['daily_stats']['loss'] += 1
@@ -468,35 +386,12 @@ def live_monitor_loop():
                             if signal_num and str(signal_num) in state.get('active_reminders', {}):
                                 state['active_reminders'][str(signal_num)] = False
                                 
-                            if new_step > 3:
-                                est_fee = (margin * leverage) * 0.0016 
-                                total_blacklist_loss = loss_amount + est_fee
-                    
-                                state['shared_loss_buffer'] += total_blacklist_loss
-                                state['total_loss_cost'] += total_blacklist_loss
-                
-                                state['symbol_recovery_step'][s] = 0
-                                state['symbol_accumulated_loss'][s] = 0.0
-                                if s not in state['block_list']:
-                                    state['block_list'].append(s)
-                                if s not in state['daily_stats']['blacklist_coins']:
-                                    state['daily_stats']['blacklist_coins'].append(s)
-                                    
-                                if s in state.get('first_win_list', []):
-                                    state['first_win_list'].remove(s)
-                                if s in state.get('first_win_coins', []):
-                                    state['first_win_coins'].remove(s)
-                                    
-                                sl_msg = (f"🛑 <b>MAX RECOVERY FAILED (LOSS)!</b> 🔴\n\n"
-                                          f"📍 Coin: <code>{s}</code>\n"
-                                          f"💸 Loss: <b>-${round(loss_amount, 2)}</b>\n"
-                                          f"🏁 Exit Price: <code>{current_p}</code>\n"
-                                          f"🚫 Step 3 ඉක්මවා ඇති බැවින් මෙම කාසිය Blacklist කර FWL ලැයිස්තු වලින් ඉවත් කරන ලදී.")
-                                execute_telegram_send(sl_msg)
-                            else:
-                                state['symbol_recovery_step'][s] = new_step
-                                state['symbol_accumulated_loss'][s] = state['symbol_accumulated_loss'].get(s, 0.0) + loss_amount
-                        
+                        sl_msg = (f"🛑 <b>STOP LOSS (LOSS)!</b> 🔴\n\n"
+                                  f"📍 Coin: <code>{s}</code>\n"
+                                  f"💸 Loss Amount: <b>-${round(loss_amount, 2)}</b>\n"
+                                  f"🏁 Exit Price: <code>{current_p}</code>\n"
+                                  f"📊 Total Losses Recorded: <b>{state['symbol_loss_details'].get(s, {}).get('count', 0)}</b>")
+                        execute_telegram_send(sl_msg)
                         sync_save()
 
                 except Exception as inner_e:
@@ -555,6 +450,10 @@ def telegram_webhook():
                 sync_save()
                 execute_telegram_send("✅ <b>Signal Reminder නවතාලන ලදී!</b>")
 
+            elif cmd == "botrun":
+                with state_lock: state['is_paused'] = False
+                sync_save(); execute_telegram_send("🚀 <b>/botrun විධානය ක්‍රියාත්මකයි!</b> බොට් දැන් සිග්නල් සෙවීම ආරම්භ කළා.")
+
             elif cmd == "reminder_on":
                 with state_lock: state['reminder_enabled'] = True
                 sync_save()
@@ -567,11 +466,27 @@ def telegram_webhook():
 
             elif cmd == "bot_on":
                 with state_lock: state['is_paused'] = False
-                sync_save(); execute_telegram_send("🟢 බොට් සාර්ථකව සක්‍රීය කරන ලදී. සිග්නල් සෙවීම ආරම්භ කලා!")
+                sync_save(); execute_telegram_send("🟢 බොට් සාර්ථකව සක්‍රීය කරන ලදී!")
                 
             elif cmd == "bot_off":
                 with state_lock: state['is_paused'] = True
                 sync_save(); execute_telegram_send("⏸️ බොට් තාවකාලිකව අක්‍රීය කරන ලදී. නව ට්‍රේඩ් ගැනීම නවතා ඇත.")
+
+            elif cmd == "loss_balance":
+                with state_lock:
+                    loss_details = dict(state.get('symbol_loss_details', {}))
+                
+                if not loss_details:
+                    execute_telegram_send("📊 <b>Loss Balance වාර්තාව:</b>\n\nකිසිදු Loss එකක් වාර්තා වී නැත.")
+                else:
+                    report_lines = ["📊 <b>Loss Balance වාර්තාව:</b>\n"]
+                    report_lines.append("<code>Coin Name       Loss Count    Loss Amount</code>")
+                    report_lines.append("<code>-----------------------------------------</code>")
+                    for coin, info in loss_details.items():
+                        count = info['count']
+                        total_amt = round(sum(info['amounts']), 2)
+                        report_lines.append(f"<code>{coin:<15} {count:<13} {total_amt}</code>")
+                    execute_telegram_send("\n".join(report_lines))
 
             elif cmd == "set_max_signals" and len(tokens) > 1:
                 try:
@@ -581,51 +496,31 @@ def telegram_webhook():
                     sync_save()
                     execute_telegram_send(f"⚙️ Active Trade Limit එක {new_limit} ලෙස සාර්ථකව වෙනස් කරන ලදී.")
                 except Exception as e:
-                    execute_telegram_send("❌ දෝෂයකි! කරුණාකර නිවැරදි අංකයක් ලබා දෙන්න. (උදා: /set_max_signals 15)")
+                    execute_telegram_send("❌ දෝෂයකි! කරුණාකර නිවැරදි අංකයක් ලබා දෙන්න.")
             
             elif cmd == "status":
                 with state_lock:
-                    if state.get('direct_mode'):
-                        mode_str = "DIRECT MODE 🔥"
-                    elif state.get('recovery_only_mode'):
-                        mode_str = "RECOVERY ONLY ⚠️"
-                    else:
-                        mode_str = "NORMAL MODE 🔄"
-                    
-                    recovery_count = 0
-                    for pos in state['active_positions'].values():
-                        if pos.get('step', 0) > 0:
-                            recovery_count += 1
-                    
-                    start_t = f"{state.get('start_hour', 12):02d}:{state.get('start_minute', 30):02d}"
+                    start_t = f"{state.get('start_hour', 0):02d}:{state.get('start_minute', 0):02d}"
                     end_t = f"{state.get('end_hour', 23):02d}:{state.get('end_minute', 59):02d}"
-                    
                     fwl_list = state.get('first_win_list', [])
-                    fw_coins = state.get('first_win_coins', [])
                     rem_status = "සක්‍රීයයි 🟢" if state.get('reminder_enabled', True) else "අක්‍රීයයි 🔴"
                     
                     msg = (f"ℹ️ <b>[RED BULL MASTER STATUS REPORT]</b>\n"
                            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                           f"▶️ ස්කෑනර් එන්ජිම: <b>{'අක්‍රීයයි (OFF)' if state.get('is_paused') else 'සක්‍රීයයි (ON)'}</b>\n"
+                           f"▶️ බොට් තත්ත්වය: <b>{'අක්‍රීයයි (OFF)' if state.get('is_paused') else 'ක්‍රියාත්මකයි (RUNNING)'}</b>\n"
                            f"🔥 Active ට්‍රේඩ් ගණන: <b>{len(state['active_positions'])} / {state.get('max_signals', 10)}</b>\n"
                            f"📢 මතක් කිරීමේ පද්ධතිය: <b>{rem_status}</b>\n"
-                           f"⚙️ Mode: <b>{mode_str}</b>\n"
-                           f"⏱️ BOT WINDOW STATUS : <b>{'OFFLINE 🔴' if state.get('is_paused') else 'ONLINE 🟢'}</b>\n"
                            f"⏰ සිග්නල් දෙන කාලය: <b>{start_t} - {end_t} දක්වා.</b>\n"
                            f"💵 මූලික ට්‍රේඩ් මාජින්: <b>${state.get('base_margin', 0.80)}</b>\n"
                            f"⚙️ Leverage: <b>{state.get('leverage', 10)}x</b>\n"
-                           f"🛡️ SL: <b>{state.get('margin_sl_pct', 27.0)}%</b> | TP: <b>{state.get('fast_tp_pct', 30.0)}%</b>\n"
-                           f"🔄 Recovery Trade ගණන: <b>{recovery_count}</b>\n"
-                           f"🥇 First Win List ගණන: <b>{len(fwl_list)}</b>\n"
-                           f"🏆 First Win Coins ගණන: <b>{len(fw_coins)}</b>\n"
-                           f"🚫 Blacklist Coins ගණන: <b>{len(state.get('block_list', []))}</b>\n\n"
-                           f"💰 <b>Total Loss Cost:</b> <b>${round(state.get('total_loss_cost', 0.0), 2)}</b>\n"
-                           f"🏆 First Win Coin: <code>{' '.join(fw_coins) if fw_coins else 'None'}</code>")
+                           f"🥇 FWL කාසි ලැයිස්තුව: <code>{' '.join(fwl_list) if fwl_list else 'None'}</code>\n"
+                           f"🚫 Blacklist Coins ගණන: <b>{len(state.get('block_list', []))}</b>")
                 execute_telegram_send(msg)
 
             elif cmd == "menu":
                 menu_msg = ("📜 <b>RED BULL MASTER COMMANDS MENU</b>\n━━━━━━━━━━━━━━━━━\n"
                             "<b>1. මූලික පාලන විධානයන් (Basic Controls)</b>\n"
+                            "• /botrun : බොට් ක්‍රියාත්මක කිරීම ආරම්භ කිරීම.\n"
                             "• /bot_on : බොට් සක්‍රීය කරයි.\n"
                             "• /bot_off : බොට් තාවකාලිකව අක්‍රීය කරයි.\n"
                             "• /ok : Alert Reminder පද්ධතිය නවතාලයි.\n"
@@ -633,76 +528,42 @@ def telegram_webhook():
                             "• /reminder_off : Reminder Alert පද්ධතිය OFF කරයි.\n"
                             "• /status : බොට්ගේ වත්මන් තත්ත්වය පෙන්වයි.\n"
                             "• /set_max_signals [NUMBER] : එකවර ගත හැකි උපරිම ට්‍රේඩ් ගණන වෙනස් කරයි.\n"
-                            "• /menu : ප්‍රධාන විධානයන් ලැයිස්තුව ගෙන්වා ගනී.\n\n"
-                            "<b>2. මාදිලි මාරු කිරීම (Mode Switching)</b>\n"
-                            "• /direct_mode_on : Direct Mode සක්‍රීය කරයි.\n"
-                            "• /direct_mode_off : Direct Mode අක්‍රීය කරයි (Safe Mode).\n"
-                            "• /recovery_only_on : Recovery Only මාදිලිය සක්‍රීය කරයි.\n"
-                            "• /recovery_only_off : Recovery Only මාදිලිය අක්‍රීය කරයි.\n\n"
-                            "<b>3. කාසි ලැයිස්තු පාලනය (FWL Commands)</b>\n"
-                            "• /fwl_scanner : First Win Scanner එක අතින් ක්‍රියාත්මක කරයි.\n"
-                            "• /fwl_view : FWL ලැයිස්තුවේ ඇති සියලුම කාසි පෙන්වයි.\n"
+                            "• /menu : ප්‍රධාන විධානයන් ලැයිස්තුව ගෙන්වා ගනී.\n"
+                            "• /loss_balance : එකතු වූ loss අගය පෙන්වයි.\n\n"
+                            "<b>2. කාසි ලැයිස්තු පාලනය (FWL Commands)</b>\n"
                             "• /fwl_add [COIN] : කාසි අතින්ම FWL ලැයිස්තුවට එකතු කරයි.\n"
-                            "• /fwl_remove [COIN] : FWL ලැයිස්තුවෙන් කාසි ඉවත් කරයි.\n"
-                            "• /clear_lists : FWL ලැයිස්තුව සහ FW Coins ලැයිස්තුව සම්පූර්ණයෙන්ම හිස් කරයි.\n\n"
-                            "<b>4. තහනම් කාසි ලැයිස්තුව (Blacklist Commands)</b>\n"
+                            "• /fwl_remove [COIN] : කාසි ලැයිස්තුවෙන් ඉවත් කරයි.\n"
+                            "• /clear_lists : FWL ලැයිස්තුව සම්පූර්ණයෙන්ම හිස් කරයි.\n\n"
+                            "<b>3. තහනම් කාසි ලැයිස්තුව (Blacklist Commands)</b>\n"
                             "• /blacklist_view : Blacklist කර ඇති කාසි ලැයිස්තුව පෙන්වයි.\n"
                             "• /backlist_add [COIN] : කාසි Blacklist එකට එකතු කරයි.\n"
                             "• /backlist_remo [COIN] : කාසි Blacklist එකෙන් ඉවත් කරයි.\n\n"
-                            "<b>5. කාල සීමාවන් සහ ට්‍රේඩ් රීසෙට් (Time & Reset)</b>\n"
-                            "• /symbol_scanner : මුළු Binance වෙළඳපොළම ස්කෑන් කිරීම ආරම්භ කරයි.\n"
+                            "<b>4. කාල සීමාවන් සහ ට්‍රේඩ් රීසෙට් (Time & Reset)</b>\n"
                             "• /set_signal_time [START] [END] : සිග්නල් සෙවිය යුතු කාලය සකසයි.\n"
-                            "• /set_fw_time [START] [END] : FW Scanner ක්‍රියාත්මක විය යුතු කාලය සකසයි.\n"
                             "• /reset_trades : පවතින Active Trades දත්ත පද්ධතියෙන් මකා දමයි.\n\n"
-                            "<b>6. Buffer & Blacklist Settings</b>\n"
+                            "<b>5. Buffer & Blacklist Settings</b>\n"
                             "• /blacklist_balance_set [VALUE] : Blacklist balance set අගය වෙනස් කරයි.\n"
                             "• /buffer_status : බෆර් සහ බ්ලැක්ලිස්ට් තත්ත්වය පෙන්වයි.")
                 execute_telegram_send(menu_msg)
-
-            elif cmd == "direct_mode_on":
-                with state_lock: state['direct_mode'] = True
-                sync_save(); execute_telegram_send("🔥 Direct Mode සක්‍රීයයි! (FWL නොමැතිව කෙලින්ම ට්‍රේඩ් විවෘත වේ)")
-
-            elif cmd == "direct_mode_off":
-                with state_lock: state['direct_mode'] = False
-                sync_save(); execute_telegram_send("🛡️ Direct Mode අක්‍රීයයි! (Safe Mode - ට්‍රේඩ් ගන්නේ FWL වලින් පමණි)")
-
-            elif cmd == "recovery_only_on":
-                with state_lock: state['recovery_only_mode'] = True
-                sync_save(); execute_telegram_send("⚠️ Recovery Only මාදිලිය සක්‍රීයයි! අලුත් කාසි වලට ට්‍රේඩ් ගන්නේ නැත.")
-
-            elif cmd == "recovery_only_off":
-                with state_lock: state['recovery_only_mode'] = False
-                sync_save(); execute_telegram_send("🔄 Recovery Only මාදිලිය අක්‍රීයයි! සාමාන්‍ය පරිදි සියලුම ක්‍රියාවලීන් සිදුවේ.")
-
-            elif cmd == "fwl_scanner":
-                threading.Thread(target=run_symbol_scanner_process, daemon=True).start()
-
-            elif cmd == "fwl_view":
-                with state_lock: 
-                    fwl = ", ".join(state.get('first_win_list', [])) if state.get('first_win_list') else "ලැයිස්තුව හිස් ය"
-                    fw_coins = ", ".join(state.get('first_win_coins', [])) if state.get('first_win_coins') else "ලැයිස්තුව හිස් ය"
-                execute_telegram_send(f"🥇 <b>[FIRST WIN LIST]</b>\n<code>{fwl}</code>\n\n🏆 <b>[FIRST WIN COINS]</b>\n<code>{fw_coins}</code>")
 
             elif cmd == "fwl_add" and len(tokens) > 1:
                 with state_lock:
                     for coin in tokens[1:]:
                         c = coin.upper()
+                        if not c.endswith("USDT"): c += "USDT"
                         if c not in state['first_win_list']: state['first_win_list'].append(c)
-                sync_save(); execute_telegram_send("✅ කාසි FWL ලැයිස්තුවට ඇතුලත් කලා.")
+                sync_save(); execute_telegram_send("✅ කාසි FWL ලැයිස්තුවට සාර්ථකව ඇතුළත් කළා.")
 
             elif cmd == "fwl_remove" and len(tokens) > 1:
                 with state_lock:
                     for coin in tokens[1:]:
                         c = coin.upper()
                         if c in state['first_win_list']: state['first_win_list'].remove(c)
-                sync_save(); execute_telegram_send("❌ කාසි FWL ලැයිස්තුවෙන් ඉවත් කලා.")
+                sync_save(); execute_telegram_send("❌ කාසි FWL ලැයිස්තුවෙන් ඉවත් කළා.")
 
             elif cmd == "clear_lists":
-                with state_lock: 
-                    state['first_win_list'] = []
-                    state['first_win_coins'] = []
-                sync_save(); execute_telegram_send("🗑️ First Win ලැයිස්තු දෙකම සම්පූර්ණයෙන්ම හිස් කරන ලදී.")
+                with state_lock: state['first_win_list'] = []
+                sync_save(); execute_telegram_send("🗑️ First Win ලැයිස්තුව සම්පූර්ණයෙන්ම හිස් කරන ලදී.")
 
             elif cmd == "blacklist_view":
                 with state_lock: bl = ", ".join(state.get('block_list', [])) if state.get('block_list') else "ලැයිස්තුව හිස් ය"
@@ -712,25 +573,16 @@ def telegram_webhook():
                 with state_lock:
                     for coin in tokens[1:]:
                         c = coin.upper()
-                        if c not in state['block_list']: 
-                            state['block_list'].append(c)
-                        
-                        if c in state.get('first_win_list', []):
-                            state['first_win_list'].remove(c)
-                        if c in state.get('first_win_coins', []):
-                            state['first_win_coins'].remove(c)
-                        
-                sync_save(); execute_telegram_send("🚫 කාසි සාර්ථකව Blacklist එකට ඇතුලත් කර FWL ලැයිස්තු වලින් ඉවත් කලා.")
+                        if c not in state['block_list']: state['block_list'].append(c)
+                        if c in state.get('first_win_list', []): state['first_win_list'].remove(c)
+                sync_save(); execute_telegram_send("🚫 කාසි සාර්ථකව Blacklist එකට ඇතුළත් කළා.")
 
             elif cmd == "backlist_remo" and len(tokens) > 1:
                 with state_lock:
                     for coin in tokens[1:]:
                         c = coin.upper()
                         if c in state['block_list']: state['block_list'].remove(c)
-                sync_save(); execute_telegram_send("🟢 කාසි Blacklist එකෙන් ඉවත් කලා.")
-
-            elif cmd == "symbol_scanner":
-                threading.Thread(target=run_symbol_scanner_process, daemon=True).start()
+                sync_save(); execute_telegram_send("🟢 කාසි Blacklist එකෙන් ඉවත් කළා.")
 
             elif cmd == "set_signal_time" and len(tokens) > 2:
                 try:
@@ -739,17 +591,7 @@ def telegram_webhook():
                     with state_lock:
                         state['start_hour'], state['start_minute'] = int(start[0]), int(start[1])
                         state['end_hour'], state['end_minute'] = int(end[0]), int(end[1])
-                    sync_save(); execute_telegram_send(f"⏰ සිග්නල් සෙවීමේ කාලය {tokens[1]} සිට {tokens[2]} දක්වා සකස් කලා.")
-                except Exception as e: pass
-
-            elif cmd == "set_fw_time" and len(tokens) > 2:
-                try:
-                    start = tokens[1].split(":")
-                    end = tokens[2].split(":")
-                    with state_lock:
-                        state['fw_start_hour'], state['fw_start_minute'] = int(start[0]), int(start[1])
-                        state['fw_end_hour'], state['fw_end_minute'] = int(end[0]), int(end[1])
-                    sync_save(); execute_telegram_send(f"⏰ First Win Scanner කාලය {tokens[1]} සිට {tokens[2]} දක්වා සකස් කලා.")
+                    sync_save(); execute_telegram_send(f"⏰ සිග්නල් සෙවීමේ කාලය {tokens[1]} සිට {tokens[2]} දක්වා සකස් කළා.")
                 except Exception as e: pass
 
             elif cmd == "reset_trades":
@@ -767,11 +609,11 @@ def telegram_webhook():
                         execute_telegram_send(f"✅ Blacklist balance set updated to: {new_val}")
                     else:
                         current_val = state.get('blacklist_balance_set', 0.10)
-                        execute_telegram_send(f"ℹ️ Current blacklist balance set: {current_val}\nUsage: /blacklist_balance_set 0.10")
+                        execute_telegram_send(f"ℹ️ Current blacklist balance set: {current_val}")
                 except Exception as e:
                     execute_telegram_send(f"❌ Error: {e}")
 
-            elif cmd == "buffer_status" or text.startswith('/buffer_status') or text.startswith('/blacklist_amount'):
+            elif cmd == "buffer_status" or text.startswith('/buffer_status'):
                 with state_lock:
                     buf = state.get('shared_loss_buffer', 0.0)
                     tot_cost = state.get('total_loss_cost', 0.0)
