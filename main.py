@@ -59,7 +59,7 @@ def load_data():
     default_state = {
         'active_positions': {},        
         'symbol_recovery_step': {},     
-        'symbol_loss_details': {},      # {symbol: {'count': count, 'amounts': [amounts...]}}
+        'symbol_loss_details': {},      # {symbol: {'count': count, 'amounts': [...]}}
         'block_list': [],  
         'signal_count': 0, 
         'is_paused': True,              
@@ -72,14 +72,17 @@ def load_data():
         'first_win_coins': [], 
         'shared_loss_buffer': 0.0,       
         'total_loss_cost': 0.0,
-        'total_recovered_amount': 0.0,  # නව එකතු කිරීම: මෙතෙක් cover කරන ලද අගය
 
         'base_margin': 0.80,            
         'margin_sl_pct': 27.0,          
         'fast_tp_pct': 30.0,            
-        'rtp_pct': 45.0,                # නව RTP අගය (Default = 45%)
+        'rtp_pct': 45.0,                # නව RTP Default අගය (45%)
         'leverage': 10,                 
         'blacklist_balance_set': 0.10,
+        
+        # නව Loss Balance වෙනස්කම් සඳහා දත්ත ගබඩාව
+        'loss_to_cover': 0.0,           # Loss cover කිරීමට ඇති අගය
+        'loss_covered': 0.0,            # Loss cover කරන ලද අගය
         
         'start_hour': 0,
         'start_minute': 0,
@@ -239,12 +242,8 @@ def execute_new_trade(s, side, current_p):
             leverage = state.get('leverage', 10)
             bh_balance_set = state.get('blacklist_balance_set', 0.10)
             rtp_pct = state.get('rtp_pct', 45.0)
-            fast_tp_pct = state.get('fast_tp_pct', 30.0)
             
-            # පරීක්ෂා කිරීම: මෙම කොයින් එකට හෝ general loss balance එකක් ඇත්දැයි බැලීම
-            has_loss_balance = False
             pending_loss_to_add = 0.0
-            
             if s in state.get('symbol_loss_details', {}):
                 loss_info = state['symbol_loss_details'][s]
                 if loss_info['count'] > 0 and loss_info['amounts']:
@@ -252,18 +251,18 @@ def execute_new_trade(s, side, current_p):
                     loss_info['count'] = len(loss_info['amounts'])
                     if loss_info['count'] == 0:
                         del state['symbol_loss_details'][s]
-                    has_loss_balance = True
 
         position_size = current_margin * leverage 
         coin_sl_move_pct = (sl_margin_pct / leverage) / 100.0 
-        est_fee = position_size * 0.0016  
         
-        # 2 සහ 3 රීති වලට අනුව TP ගණනය කිරීම:
-        # පාඩුවක් පියවා ගැනීමට ඇති විට (Recovery Mode / Loss balance තිබේ නම්) RTP ප්‍රතිශතය භාවිත කරයි.
-        if has_loss_balance or pending_loss_to_add > 0.0:
-            target_profit_dollar = (current_margin * (rtp_pct / 100.0)) + pending_loss_to_add + est_fee + bh_balance_set
+        # TP ගණනය කිරීමේ රීති (Recovery Mode හෝ Normal Mode අනුව)
+        if step == 0 and pending_loss_to_add == 0.0:
+            # First Trade / Normal Win
+            target_profit_dollar = (current_margin * (state.get('fast_tp_pct', 30.0) / 100.0)) + bh_balance_set
         else:
-            target_profit_dollar = (current_margin * (fast_tp_pct / 100.0)) + bh_balance_set
+            # Recovery Mode / Step Recovery (මුලික මාජින් එකෙන් RTP ප්‍රතිශතය ගණනය කිරීම)
+            base_target = current_margin * (rtp_pct / 100.0)
+            target_profit_dollar = base_target + bh_balance_set
 
         required_move_pct = target_profit_dollar / position_size
 
@@ -288,7 +287,7 @@ def execute_new_trade(s, side, current_p):
                f"💵 Margin: <b>${current_margin}</b> | Leverage: <b>{leverage}x</b>\n"
                f"🎯 Target TP: <code>{round(initial_tp, 5)}</code>\n"
                f"🛑 Target SL: <code>{round(initial_sl, 5)}</code>\n"
-               f"📈 Step: <b>{step}</b> | Attached Loss: <b>${round(pending_loss_to_add, 2)}</b>\n\n"
+               f"📈 Step: <b>{step}</b> | RTP: <b>{rtp_pct}%</b>\n\n"
                f"💡 <i>Alerts නතර කිරීමට <b>/ok</b> ලෙස Type කරන්න.</i>")
         execute_telegram_send(msg)
         sync_save()
@@ -316,7 +315,6 @@ def live_monitor_loop():
                 step = pos.get('step', 0)
                 margin = pos.get('margin', 0.80)
                 signal_num = pos.get('signal_num', None)
-                attached_loss = pos.get('attached_loss', 0.0)
                 
                 try:
                     k_res2 = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=1", timeout=10)
@@ -327,18 +325,20 @@ def live_monitor_loop():
                     
                     if is_tp:
                         print(f"🎯 TP HIT for {s}! Price: {current_p}")
-                        fast_tp_pct = state.get('fast_tp_pct', 30.0)
-                        rtp_pct = state.get('rtp_pct', 45.0)
-                        
-                        # රීති 3 අනුව ලාභය හෝ recovery ගණනය කිරීම
-                        if attached_loss > 0.0:
-                            profit_amount = margin * (rtp_pct / 100.0)
-                            recovered_val = attached_loss
-                        else:
-                            profit_amount = margin * (fast_tp_pct / 100.0)
-                            recovered_val = 0.0
                         
                         with state_lock:
+                            # Step Recovery & Win පරීක්ෂාව
+                            has_loss_balance = (state.get('symbol_loss_details', {}) or state.get('loss_to_cover', 0.0) > 0)
+                            if not has_loss_balance:
+                                profit_amount = margin * (state.get('fast_tp_pct', 30.0) / 100.0)
+                            else:
+                                profit_amount = margin * (state.get('rtp_pct', 45.0) / 100.0)
+                                # Loss cover කළ පසු loss_to_cover එකෙන් අඩු කර loss_covered වෙත එකතු කිරීම
+                                if state.get('loss_to_cover', 0.0) > 0:
+                                    covered_amt = min(profit_amount, state['loss_to_cover'])
+                                    state['loss_to_cover'] -= covered_amt
+                                    state['loss_covered'] += covered_amt
+
                             if s in state['active_positions']:
                                 del state['active_positions'][s]
                             
@@ -348,9 +348,6 @@ def live_monitor_loop():
                             state['stats']['wins'] += 1
                             state['daily_stats']['wins'] += 1
                             state['daily_stats']['win_amount'] += profit_amount
-                            
-                            if recovered_val > 0.0:
-                                state['total_recovered_amount'] = state.get('total_recovered_amount', 0.0) + recovered_val
                             
                             if signal_num and str(signal_num) in state.get('active_reminders', {}):
                                 state['active_reminders'][str(signal_num)] = False
@@ -374,14 +371,13 @@ def live_monitor_loop():
                             
                             state['symbol_recovery_step'][s] = 0
                             
-                            # 1 සහ 4 රීති අනුව: SL වූ හෝ Blacklist වූ සියලුම පාඩු Loss Balance එකට එකතු කරන්න
+                            # RECOVERY හා BLACKLIST වු සියලුම පාඩු LOSS BALANCE (loss_to_cover) වෙත එකතු කිරීම
+                            state['loss_to_cover'] += loss_amount
+                            
                             if s not in state['symbol_loss_details']:
                                 state['symbol_loss_details'][s] = {'count': 0, 'amounts': []}
                             state['symbol_loss_details'][s]['count'] += 1
                             state['symbol_loss_details'][s]['amounts'].append(loss_amount)
-                            
-                            # total_loss_cost යාවත්කාලීන කිරීම
-                            state['total_loss_cost'] = state.get('total_loss_cost', 0.0) + loss_amount
                             
                             loss_count_total = state['symbol_loss_details'][s]['count']
                             if loss_count_total >= 3:
@@ -394,7 +390,7 @@ def live_monitor_loop():
                                 
                                 bl_msg = (f"🚫 <b>MAX LOSS REACHED (BLACKLISTED)!</b> 🔴\n\n"
                                           f"📍 Coin: <code>{s}</code>\n"
-                                          f"⚠️ මෙම කාසිය 3 වරක් Loss වී ඇති බැවින් ස්වයංක්‍රීයව Blacklist කරන ලදී.")
+                                          f"⚠️ මෙම කාසිය 3 වරක් Loss වී ඇති බැවින් ස්වයංක්‍රීයව Blacklist කරන ලදී. පාඩුව Loss Balance වෙත එකතු විය.")
                                 execute_telegram_send(bl_msg)
                             
                             state['stats']['loss'] += 1
@@ -408,7 +404,7 @@ def live_monitor_loop():
                                   f"📍 Coin: <code>{s}</code>\n"
                                   f"💸 Loss Amount: <b>-${round(loss_amount, 2)}</b>\n"
                                   f"🏁 Exit Price: <code>{current_p}</code>\n"
-                                  f"📊 Total Losses Recorded: <b>{state['symbol_loss_details'].get(s, {}).get('count', 0)}</b>")
+                                  f"📊 Total Loss Balance (To Cover): <b>${round(state.get('loss_to_cover', 0.0), 2)}</b>")
                         execute_telegram_send(sl_msg)
                         sync_save()
 
@@ -490,39 +486,43 @@ def telegram_webhook():
                 with state_lock: state['is_paused'] = True
                 sync_save(); execute_telegram_send("⏸️ බොට් තාවකාලිකව අක්‍රීය කරන ලදී. නව ට්‍රේඩ් ගැනීම නවතා ඇත.")
 
+            # --- නව /RTP විධානය ---
+            elif cmd == "rtp":
+                if len(tokens) > 1:
+                    try:
+                        new_rtp = float(tokens[1])
+                        with state_lock:
+                            state['rtp_pct'] = new_rtp
+                        sync_save()
+                        execute_telegram_send(f"⚙️ <b>RTP අගය සාර්ථකව {new_rtp}% ලෙස වෙනස් කරන ලදී.</b>")
+                    except Exception as e:
+                        execute_telegram_send("❌ දෝෂයකි! කරුණාකර නිවැරදි අංකයක් ලබා දෙන්න (උදා: <code>/RTP 45</code>)")
+                else:
+                    current_rtp = state.get('rtp_pct', 45.0)
+                    execute_telegram_send(f"ℹ️ වත්මන් <b>RTP අගය:</b> <code>{current_rtp}%</code>\nවෙනස් කිරීමට: <code>/RTP [අගය]</code> ලෙස භාවිතා කරන්න.")
+
+            # --- නව /loss_balance විධානය (Loss cover කිරීමට ඇති සහ කරන ලද අගයන් වෙනම පෙන්වීම) ---
             elif cmd == "loss_balance":
                 with state_lock:
+                    to_cover = state.get('loss_to_cover', 0.0)
+                    covered = state.get('loss_covered', 0.0)
                     loss_details = dict(state.get('symbol_loss_details', {}))
-                    tot_loss_cost = state.get('total_loss_cost', 0.0)
-                    tot_recovered = state.get('total_recovered_amount', 0.0)
                 
                 report_lines = [
                     "📊 <b>Loss Balance වාර්තාව:</b>\n",
-                    f"🔹 <b>Loss Cover කිරීමට ඇති අගය (Total Loss Cost):</b> <code>${round(tot_loss_cost, 2)}</code>",
-                    f"🔹 <b>Loss Cover කරන ලද අගය (Total Recovered):</b> <code>${round(tot_recovered, 2)}</code>\n"
+                    f"🔴 <b>Loss Cover කිරීමට ඇති අගය (To Cover):</b> <code>${round(to_cover, 2)}</code>",
+                    f"🟢 <b>Loss Cover කරන ලද අගය (Covered):</b> <code>${round(covered, 2)}</code>\n",
+                    "<code>Coin Name       Loss Count    Loss Amount</code>",
+                    "<code>-----------------------------------------</code>"
                 ]
-                
                 if not loss_details:
-                    report_lines.append("කිසිදු අස්ථානගත වූ Loss එකක් වාර්තා වී නැත.")
+                    report_lines.append("<i>කිසිදු Loss එකක් වාර්තා වී නැත.</i>")
                 else:
-                    report_lines.append("<code>Coin Name       Loss Count    Loss Amount</code>")
-                    report_lines.append("<code>-----------------------------------------</code>")
                     for coin, info in loss_details.items():
                         count = info['count']
                         total_amt = round(sum(info['amounts']), 2)
                         report_lines.append(f"<code>{coin:<15} {count:<13} {total_amt}</code>")
-                
                 execute_telegram_send("\n".join(report_lines))
-
-            elif cmd == "rtp" and len(tokens) > 1:
-                try:
-                    new_rtp = float(tokens[1])
-                    with state_lock:
-                        state['rtp_pct'] = new_rtp
-                    sync_save()
-                    execute_telegram_send(f"⚙️ RTP (Recovery Take Profit) ප්‍රතිශතය <b>{new_rtp}%</b> ලෙස සාර්ථකව වෙනස් කරන ලදී.")
-                except Exception as e:
-                    execute_telegram_send("❌ දෝෂයකි! කරුණාකර නිවැරදි අංකයක් ලබා දෙන්න (උදා: /rtp 45).")
 
             elif cmd == "set_max_signals" and len(tokens) > 1:
                 try:
@@ -534,16 +534,25 @@ def telegram_webhook():
                 except Exception as e:
                     execute_telegram_send("❌ දෝෂයකි! කරුණාකර නිවැරදි අංකයක් ලබා දෙන්න.")
             
+            # --- Status විධානය ඉල්ලීමට අනුව යාවත්කාලීන කිරීම ---
             elif cmd == "status":
                 with state_lock:
                     start_t = f"{state.get('start_hour', 0):02d}:{state.get('start_minute', 0):02d}"
                     end_t = f"{state.get('end_hour', 23):02d}:{state.get('end_minute', 59):02d}"
                     fwl_list = state.get('first_win_list', [])
                     rem_status = "සක්‍රීයයි 🟢" if state.get('reminder_enabled', True) else "අක්‍රීයයි 🔴"
-                    mode_status = "අක්‍රීයයි (OFF)" if state.get('is_paused') else "NORMAL MODE 🔄"
+                    mode_status = "NORMAL MODE 🔄" if state.get('is_paused') else "ACTIVE / RUNNING 🟢"
                     bot_window_status = "ONLINE 🟢" if is_ict_trading_window() else "OFFLINE 🔴"
-                    
-                    total_loss_cost_val = state.get('total_loss_cost', 0.0)
+                    total_loss_cost = state.get('loss_to_cover', 0.0)
+                    base_margin = state.get('base_margin', 0.80)
+                    leverage = state.get('leverage', 10)
+                    sl_pct = state.get('margin_sl_pct', 27.0)
+                    tp_pct = state.get('fast_tp_pct', 30.0)
+                    rtp_pct = state.get('rtp_pct', 45.0)
+                    recovery_trades_count = len([p for p in state.get('active_positions', {}).values() if p.get('step', 0) > 0])
+                    first_win_count = len(fwl_list)
+                    blacklist_count = len(state.get('block_list', []))
+                    fwl_coins_str = " ".join(fwl_list) if fwl_list else "None"
                     
                     msg = (
                         f"ℹ️ <b>[Mr. MASTER STATUS REPORT]</b>\n"
@@ -553,14 +562,14 @@ def telegram_webhook():
                         f"⚙️ Mode: <b>{mode_status}</b>\n"
                         f"⏱️ BOT WINDOW STATUS : <b>{bot_window_status}</b>\n"
                         f"⏰ සිග්නල් දෙන කාලය: <b>{start_t} - {end_t} දක්වා.</b>\n"
-                        f"💵 මූලික ට්‍රේඩ් මාජින්: <b>${state.get('base_margin', 0.80)}</b>\n"
-                        f"⚙️ Leverage: <b>{state.get('leverage', 10)}x</b>\n"
-                        f"🛡️ SL: <b>{state.get('margin_sl_pct', 27.0)}%</b> | TP: <b>{state.get('fast_tp_pct', 30.0)}%</b> | RTP: <b>{state.get('rtp_pct', 45.0)}%</b>\n"
-                        f"🔄 Recovery Trade ගණන: <b>{len(state.get('symbol_loss_details', {}))}</b>\n"
-                        f"🥇 First Win List ගණන: <b>{len(fwl_list)}</b>\n"
-                        f"🚫 Blacklist Coins ගණන: <b>{len(state.get('block_list', []))}</b>\n\n"
-                        f"💰 Total Loss Cost: <b>${round(total_loss_cost_val, 1)}</b>\n"
-                        f"🏆 First Win Coin:\n<code>{' '.join(fwl_list) if fwl_list else 'None'}</code>"
+                        f"💵 මූලික ට්‍රේඩ් මාජින්: <b>${base_margin}</b>\n"
+                        f"⚙️ Leverage: <b>{leverage}x</b>\n"
+                        f"🛡️ SL: <b>{sl_pct}%</b> | TP: <b>{tp_pct}%</b> | RTP: <b>{rtp_pct}%</b>\n"
+                        f"🔄 Recovery Trade ගණන: <b>{recovery_trades_count}</b>\n"
+                        f"🥇 First Win List ගණන: <b>{first_win_count}</b>\n"
+                        f"🚫 Blacklist Coins ගණන: <b>{blacklist_count}</b>\n\n"
+                        f"💰 Total Loss Cost: <b>${round(total_loss_cost, 2)}</b>\n"
+                        f"🏆 First Win Coin:\n<code>{fwl_coins_str}</code>"
                     )
                 execute_telegram_send(msg)
 
@@ -571,13 +580,13 @@ def telegram_webhook():
                             "• /bot_on : බොට් සක්‍රීය කරයි.\n"
                             "• /bot_off : බොට් තාවකාලිකව අක්‍රීය කරයි.\n"
                             "• /ok : Alert Reminder පද්ධතිය නවතාලයි.\n"
+                            "• /rtp [VALUE] : Recovery Take Profit ප්‍රතිශතය සකසයි.\n"
                             "• /reminder_on : Reminder Alert පද්ධතිය ON කරයි.\n"
                             "• /reminder_off : Reminder Alert පද්ධතිය OFF කරයි.\n"
                             "• /status : බොට්ගේ වත්මන් තත්ත්වය පෙන්වයි.\n"
-                            "• /rtp [VALUE] : Recovery Take Profit ප්‍රතිශතය සකසයි.\n"
                             "• /set_max_signals [NUMBER] : එකවර ගත හැකි උපරිම ට්‍රේඩ් ගණන වෙනස් කරයි.\n"
                             "• /menu : ප්‍රධාන විධානයන් ලැයිස්තුව ගෙන්වා ගනී.\n"
-                            "• /loss_balance : එකතු වූ loss සහ recovered අගයන් පෙන්වයි.\n\n"
+                            "• /loss_balance : Loss cover කිරීමට ඇති සහ කරන ලද අගයන් පෙන්වයි.\n\n"
                             "<b>2. කාසි ලැයිස්තු පාලනය (FWL Commands)</b>\n"
                             "• /fwl_add [COIN] : කාසි අතින්ම FWL ලැයිස්තුවට එකතු කරයි.\n"
                             "• /fwl_remove [COIN] : කාසි ලැයිස්තුවෙන් ඉවත් කරයි.\n"
